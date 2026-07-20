@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS docs (
 
 CREATE INDEX IF NOT EXISTS idx_active_effective_date ON docs(
     COALESCE(tentative_date, check_in_date, on_date, end_date, due_date),
-    COALESCE(sort_order, priority, 6)  -- 6 must match frontmatter::UNRANKED
+    COALESCE(sort_order, priority, 6)  -- must match frontmatter::rank(); 6 = frontmatter::UNRANKED
 ) WHERE status IN ('todo', 'in_progress', 'reminder');
 
 CREATE INDEX IF NOT EXISTS idx_status ON docs(status, on_date, end_date);
@@ -356,7 +356,9 @@ impl Cache {
             ));
         }
 
-        // TODO(sort-key-duplication): this must match todo_sort_cmp() in cli/mod.rs
+        // This must match todo_sort_cmp() in cli/mod.rs; the rank term is the
+        // canonical formula frontmatter::rank(). Guarded by the multi-repo sort
+        // integration tests.
         // TODO(sql-terminal-status-strings)
         // ORDER BY: active items first, then by effective date, rank, title.
         qb.push_str(&format!(

@@ -1,9 +1,5 @@
 # TODOs
 
-## `sort-key-duplication`
-
-The SQL `ORDER BY` in `db.rs` and the Rust `todo_sort_cmp()` in `cli/mod.rs` encode the same sort logic independently. The Rust comparator is used for k-way merge of multi-repo results; the SQL ORDER BY handles single-repo. They must agree. The integration test `test_multi_repo_sort_matches_single_repo_sql_order` catches divergence. Consider generating the sort key from a shared definition to make divergence impossible.
-
 ## `mcp-config-caching`
 
 `AppConfig::load_default()` is called on every MCP `graf_todo_query` tool call, re-reading and parsing the config file from disk each time. The MCP server is long-lived and config won't change mid-session. Load the config once at server startup and store it in `McpContext`, then reference it from tool `call()` methods without per-request I/O.

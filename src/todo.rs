@@ -1508,11 +1508,9 @@ pub struct ReorderAnchor {
 
 impl ReorderAnchor {
     /// Effective rank: `COALESCE(sort_order, priority, UNRANKED)`.
-    /// Matches the SQL `ORDER BY` and `cli::rank()`.
+    /// Delegates to the shared `frontmatter::rank` formula.
     fn rank(&self) -> f64 {
-        self.sort_order
-            .or(self.priority.map(|p| p as f64))
-            .unwrap_or(crate::frontmatter::UNRANKED)
+        crate::frontmatter::rank(self.sort_order, self.priority)
     }
 }
 
