@@ -82,9 +82,6 @@ fn str_to_effort(s: &str) -> Result<Effort> {
 // Public types
 // ---------------------------------------------------------------------------
 
-// TODO(workspace-handle): Consider a higher-level Workspace handle that wraps
-// repo_dir + Cache, so callers don't each carry repo_dir in their Options
-// structs and independently call open_and_sync.
 pub struct Cache {
     conn: rusqlite::Connection,
     repo_dir: PathBuf,

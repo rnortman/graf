@@ -632,19 +632,11 @@ pub enum DoneError {
     /// The file's frontmatter or state is not eligible for `done`
     /// (lint errors, malformed input, etc.). Returned as plain text —
     /// not one of the design-named structured codes.
-    // TODO(done-error-taxonomy-cleanup): split into named variants so
-    // frontends can branch on specific causes.
     Invalid(String),
     // --- pre-flight / MCP layer errors (not business logic) ---
-    // TODO(mcp-preflight-shared-error-type): PathNotFound and InvalidDate are
-    // structurally identical to ScheduleError::PathNotFound/InvalidDate. Extract
-    // a shared McpPreflightError type (cli/mcp.rs or cli/mcp_errors.rs) so all
-    // tool error enums embed it rather than duplicating. Deferred until
-    // cancel-mcp-envelope lands (third copy forces the issue) or
-    // done-error-derive-serialize sweeps both enums.
     // TODO(done-error-grouping-comment): add doc-comment grouping markers
     // separating pre-flight/MCP-layer, business-logic, and infra variants as
-    // DoneError grows with done-error-taxonomy-cleanup variants.
+    // DoneError grows.
     /// Path argument does not resolve in the repo (file not found,
     /// malformed slug, lint errors, etc.). Returned as a structured
     /// envelope — the LLM should check the path and retry.
@@ -730,12 +722,6 @@ impl DoneError {
     }
 
     /// Render the `{error, reason, ...payload}` JSON envelope.
-    // TODO(done-error-derive-serialize): replace hand-rolled mutation
-    // with `#[derive(Serialize)] #[serde(tag = "error", rename_all = "snake_case")]`.
-    // Phase 3 added `ScheduleError` with the same hand-rolled idiom
-    // (see below in this file), so this pattern is now load-bearing for
-    // two error enums — the derive refactor gets more valuable, not
-    // less, and should sweep both enums in one pass.
     pub fn to_json(&self) -> serde_json::Value {
         use serde_json::json;
         let mut obj = json!({
@@ -1012,10 +998,6 @@ fn done_anchored(
         ))
     })?;
 
-    // TODO(done-anchored-double-rrule-parse): this computes `naive_next` from
-    // `previous_anchor`, then may re-parse/iterate the same rrule below for
-    // `compute_occurrence_after`. A unified helper returning both in one pass
-    // would halve the work on the stale branch.
     let naive_next =
         compute_next_occurrence(rrule_str, previous_anchor).map_err(DoneError::Infra)?;
 
