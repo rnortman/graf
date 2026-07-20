@@ -616,151 +616,236 @@ fn test_reorder_bare_path_with_colon_falls_through() {
     );
 }
 
+/// Extract the ordered `tldr` sequence from a `graf todo --json` run.
+fn query_tldrs(args: &[&str], manifest: &Path) -> Vec<String> {
+    let out = graf(args, manifest);
+    assert!(
+        out.status.success(),
+        "query {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    v["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tldr"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Cross-check the SQL `ORDER BY` against the Rust merge comparator for a set
+/// of items, and pin the absolute expected order.
+///
+/// `items` is `(filename, frontmatter)`. `repo_of` assigns each item to repo 0
+/// (`life`) or 1 (`work`) for the multi-repo path, where each repo is SQL-sorted
+/// and the merged order comes from `todo_sort_cmp`. The SQL oracle places every
+/// item in a single repo, so its order is pure SQL `ORDER BY`. Both orderings
+/// must equal `expected` — the test fails even if both engines drifted in
+/// tandem. Distribute competing items across both repos so the comparator, not
+/// SQL, decides their relative order.
+fn assert_sql_matches_merge(
+    query_args: &[&str],
+    items: &[(&str, &str)],
+    repo_of: &[usize],
+    expected: &[&str],
+) {
+    assert_eq!(items.len(), repo_of.len());
+    assert!(
+        repo_of.contains(&0) && repo_of.contains(&1),
+        "comparator is only exercised cross-repo; each repo also needs >=1 commit to sync"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+
+    // SQL oracle: all items in one repo, pure SQL ORDER BY.
+    let oracle_manifest = tmp.path().join("oracle.toml");
+    let oracle = setup_repo_with_config(
+        tmp.path(),
+        "oracle",
+        "test.org/oracle",
+        "oracle",
+        None,
+        &oracle_manifest,
+    );
+    for (name, fm) in items {
+        add_task(&oracle, name, fm);
+    }
+    let sql_order = query_tldrs(query_args, &oracle_manifest);
+
+    // Rust merge: items split across two repos so the comparator decides
+    // cross-repo order.
+    let split_manifest = tmp.path().join("split.toml");
+    let life = setup_repo_with_config(
+        tmp.path(),
+        "life",
+        "test.org/life",
+        "life",
+        None,
+        &split_manifest,
+    );
+    let work = setup_repo_with_config(
+        tmp.path(),
+        "work",
+        "test.org/work",
+        "work",
+        None,
+        &split_manifest,
+    );
+    let repos = [&life, &work];
+    for ((name, fm), &r) in items.iter().zip(repo_of) {
+        add_task(repos[r], name, fm);
+    }
+    let merge_order = query_tldrs(query_args, &split_manifest);
+
+    let sql: Vec<&str> = sql_order.iter().map(String::as_str).collect();
+    let merge: Vec<&str> = merge_order.iter().map(String::as_str).collect();
+    assert_eq!(sql.as_slice(), expected, "SQL ORDER BY must match expected");
+    assert_eq!(
+        merge.as_slice(),
+        expected,
+        "Rust merge comparator must match expected"
+    );
+}
+
 #[test]
 fn test_multi_repo_sort_matches_single_repo_sql_order() {
-    // Verify the Rust sort key produces the same ordering as the SQL ORDER BY.
-    // Put several items with different sort attributes in one repo, query it
-    // both as single-repo (SQL) and multi-repo (Rust sort), compare order.
-    let tmp = tempfile::tempdir().unwrap();
-    let manifest = tmp.path().join("manifest.toml");
-
-    let repo1 =
-        setup_repo_with_config(tmp.path(), "life", "test.org/life", "life", None, &manifest);
-    let repo2 =
-        setup_repo_with_config(tmp.path(), "work", "test.org/work", "work", None, &manifest);
-
-    // Work repo needs at least one commit for graf to sync it
-    add_task(
-        &repo2,
-        "todo/placeholder.md",
-        "---\ntldr: Placeholder\nstatus: done\non_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
-
-    // Items with varied dates, priorities, and sort_orders
-    add_task(
-        &repo1,
-        "todo/jan2-pri5.md",
-        "---\ntldr: Jan2 pri5\nstatus: todo\npriority: 5\ncheck_in_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
-    add_task(
-        &repo1,
-        "todo/jan2-pri1.md",
-        "---\ntldr: Jan2 pri1\nstatus: todo\npriority: 1\ncheck_in_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
-    add_task(
-        &repo1,
-        "todo/jan1.md",
-        "---\ntldr: Jan1\nstatus: todo\npriority: 3\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
-    add_task(
-        &repo1,
-        "todo/jan2-so.md",
-        "---\ntldr: Jan2 so0.5\nstatus: todo\npriority: 5\nsort_order: 0.5\ncheck_in_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
-
-    // Single-repo query (SQL sort)
-    let out = graf(&["todo", "--json", "--repo", "life"], &manifest);
-    assert!(
-        out.status.success(),
-        "single-repo query failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let single: Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
-    let single_tldrs: Vec<&str> = single["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["tldr"].as_str().unwrap())
-        .collect();
-
-    // Multi-repo query (Rust sort) — includes empty work repo
-    let out = graf(&["todo", "--json"], &manifest);
-    assert!(
-        out.status.success(),
-        "multi-repo query failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let multi: Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
-    let multi_tldrs: Vec<&str> = multi["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["tldr"].as_str().unwrap())
-        .collect();
-
-    assert_eq!(
-        single_tldrs, multi_tldrs,
-        "Rust sort (multi-repo) must match SQL sort (single-repo)"
+    // Verify the Rust merge comparator produces the same ordering as the SQL
+    // ORDER BY across effective date, priority rank, and sort_order override.
+    // Competing jan2 items live in different repos so the comparator, not SQL,
+    // decides their order.
+    assert_sql_matches_merge(
+        &["todo", "--json"],
+        &[
+            (
+                "todo/jan1.md",
+                "---\ntldr: Jan1\nstatus: todo\npriority: 3\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/jan2-so.md",
+                "---\ntldr: Jan2 so0.5\nstatus: todo\npriority: 5\nsort_order: 0.5\ncheck_in_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/jan2-pri1.md",
+                "---\ntldr: Jan2 pri1\nstatus: todo\npriority: 1\ncheck_in_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/jan2-pri5.md",
+                "---\ntldr: Jan2 pri5\nstatus: todo\npriority: 5\ncheck_in_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+        ],
+        // Jan1→life, so0.5→work, pri1→life, pri5→work: every adjacent pair in
+        // the expected order spans repos.
+        &[0, 1, 0, 1],
+        &["Jan1", "Jan2 so0.5", "Jan2 pri1", "Jan2 pri5"],
     );
 }
 
 #[test]
 fn test_multi_repo_sort_unranked_matches_sql() {
     // Verify SQL and Rust agree on where unranked items (no sort_order,
-    // no priority) sort — they should use UNRANKED (6.0), landing after
-    // all prioritized items.
-    let tmp = tempfile::tempdir().unwrap();
-    let manifest = tmp.path().join("manifest.toml");
-
-    let repo1 =
-        setup_repo_with_config(tmp.path(), "life", "test.org/life", "life", None, &manifest);
-    let repo2 =
-        setup_repo_with_config(tmp.path(), "work", "test.org/work", "work", None, &manifest);
-
-    add_task(
-        &repo2,
-        "todo/placeholder.md",
-        "---\ntldr: Placeholder\nstatus: done\non_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+    // no priority) sort — they use UNRANKED (6.0), landing after all
+    // prioritized items. Same date, so rank alone orders them; competitors
+    // split across repos so the comparator decides. The unranked item's tldr
+    // ("A unranked") is byte-order-first, so byte order contradicts rank
+    // order: only correct rank handling (UNRANKED sorts last) yields the
+    // expected sequence — dropping the comparator's rank term reorders it.
+    let expected = ["Pri1", "Pri5", "A unranked"];
+    assert_sql_matches_merge(
+        &["todo", "--json"],
+        &[
+            (
+                "todo/pri1.md",
+                "---\ntldr: Pri1\nstatus: todo\npriority: 1\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/pri5.md",
+                "---\ntldr: Pri5\nstatus: todo\npriority: 5\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/unranked.md",
+                "---\ntldr: A unranked\nstatus: todo\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+        ],
+        // Pri1→life, Pri5→work, A unranked→life: the Pri5/unranked decision is
+        // cross-repo.
+        &[0, 1, 0],
+        &expected,
     );
+    // Unranked sorts last (rank 6.0 > priority 5) despite its byte-first tldr;
+    // enforced by the expected order inside assert_sql_matches_merge.
+}
 
-    // Same date, different rank scenarios
-    add_task(
-        &repo1,
-        "todo/pri1.md",
-        "---\ntldr: Pri1\nstatus: todo\npriority: 1\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+#[test]
+fn test_multi_repo_sort_terminal_matches_sql() {
+    // Terminal items (done/cancelled) must sort after all active items even
+    // when their effective dates are earlier. SQL uses `status IN
+    // ('done','cancelled')`; Rust uses `is_terminal()`. Both active and
+    // terminal items live in both repos, so the comparator decides the
+    // active/terminal boundary cross-repo. Query with --include-done.
+    let expected = ["Active life", "Active work", "Done life", "Cancelled work"];
+    assert_sql_matches_merge(
+        &["todo", "--json", "--include-done"],
+        &[
+            (
+                "todo/active-life.md",
+                "---\ntldr: Active life\nstatus: todo\npriority: 3\ncheck_in_date: '2020-06-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/active-work.md",
+                "---\ntldr: Active work\nstatus: todo\npriority: 3\ncheck_in_date: '2020-06-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            // Terminal items carry on_date (their post-completion effective
+            // date), set earlier than every active item's date.
+            (
+                "todo/done-life.md",
+                "---\ntldr: Done life\nstatus: done\non_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/cancelled-work.md",
+                "---\ntldr: Cancelled work\nstatus: cancelled\non_date: '2020-01-02'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+        ],
+        // life holds Active life + Done life; work holds Active work +
+        // Cancelled work. Placing Active work before Done life despite Done
+        // life's earlier date exercises terminal-last handling cross-repo.
+        &[0, 1, 0, 1],
+        &expected,
     );
-    add_task(
-        &repo1,
-        "todo/pri5.md",
-        "---\ntldr: Pri5\nstatus: todo\npriority: 5\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
-    add_task(
-        &repo1,
-        "todo/unranked.md",
-        "---\ntldr: Unranked\nstatus: todo\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
-    );
+    // Terminal items sort last, in effective-date order among themselves;
+    // enforced by the expected order inside assert_sql_matches_merge.
+}
 
-    // Single-repo (SQL)
-    let out = graf(&["todo", "--json", "--repo", "life"], &manifest);
-    assert!(out.status.success());
-    let single: Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
-    let single_tldrs: Vec<&str> = single["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["tldr"].as_str().unwrap())
-        .collect();
-
-    // Multi-repo (Rust sort)
-    let out = graf(&["todo", "--json"], &manifest);
-    assert!(out.status.success());
-    let multi: Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
-    let multi_tldrs: Vec<&str> = multi["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["tldr"].as_str().unwrap())
-        .collect();
-
-    assert_eq!(
-        single_tldrs, multi_tldrs,
-        "Rust sort must match SQL sort for unranked items"
-    );
-    // Unranked should be last (rank 6.0 > priority 5)
-    assert_eq!(
-        *single_tldrs.last().unwrap(),
-        "Unranked",
-        "unranked item should sort last"
+#[test]
+fn test_multi_repo_sort_title_tiebreak_matches_sql() {
+    // Items identical on status, effective date, and rank, differing only in
+    // tldr, split across repos and created in non-alphabetical order. The
+    // uppercase/lowercase pair (`B` / `a`) pins the shared byte-order
+    // semantics: SQLite's default BINARY collation is memcmp over UTF-8, and
+    // Rust str Ord is byte-wise, so 'B' (0x42) < 'a' (0x61) on both sides.
+    assert_sql_matches_merge(
+        &["todo", "--json"],
+        &[
+            // Added in non-alphabetical order; SQL/Rust must sort by tldr.
+            (
+                "todo/a.md",
+                "---\ntldr: a task\nstatus: todo\npriority: 3\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/d.md",
+                "---\ntldr: D task\nstatus: todo\npriority: 3\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/b.md",
+                "---\ntldr: B task\nstatus: todo\npriority: 3\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+            (
+                "todo/c.md",
+                "---\ntldr: C task\nstatus: todo\npriority: 3\ncheck_in_date: '2020-01-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+            ),
+        ],
+        // B→life, C→work, D→life, a→work: C-before-D and D-before-`a` (the
+        // case corner) are both cross-repo decisions.
+        &[1, 0, 0, 1],
+        &["B task", "C task", "D task", "a task"],
     );
 }
 

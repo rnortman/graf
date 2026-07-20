@@ -169,6 +169,15 @@ pub struct Frontmatter {
 /// One past max priority (5), so unranked items sort after all prioritized ones.
 pub const UNRANKED: f64 = 6.0;
 
+/// Sort rank: `COALESCE(sort_order, priority, UNRANKED)`.
+/// The single Rust encoding of the rank formula. The SQL encodings in
+/// `db.rs` (ORDER BY and the `idx_active_effective_date` expression index)
+/// must agree with this; integration tests in
+/// `tests/multi_repo_integration.rs` cross-check the two engines.
+pub fn rank(sort_order: Option<f64>, priority: Option<u8>) -> f64 {
+    sort_order.or(priority.map(f64::from)).unwrap_or(UNRANKED)
+}
+
 impl Frontmatter {
     /// The effective rrule string, reading the canonical nested
     /// `recurrence.rrule` first, then falling back to the legacy flat
@@ -1476,5 +1485,25 @@ assigned_to: test
             extra_in_enum.is_empty(),
             "Field variants without Frontmatter fields: {extra_in_enum:?}"
         );
+    }
+
+    #[test]
+    fn rank_sort_order_wins_over_priority() {
+        assert_eq!(rank(Some(2.5), Some(1)), 2.5);
+    }
+
+    #[test]
+    fn rank_falls_back_to_priority() {
+        assert_eq!(rank(None, Some(3)), 3.0);
+    }
+
+    #[test]
+    fn rank_falls_back_to_unranked() {
+        assert_eq!(rank(None, None), UNRANKED);
+    }
+
+    #[test]
+    fn rank_fractional_sort_order_below_priority_one() {
+        assert!(rank(Some(0.5), None) < rank(None, Some(1)));
     }
 }

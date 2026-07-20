@@ -408,13 +408,10 @@ fn todo_sort_cmp(a: &TodoItem, b: &TodoItem) -> std::cmp::Ordering {
 }
 
 /// Sort rank: `COALESCE(sort_order, priority, UNRANKED)`.
-/// Matches the SQL `ORDER BY` in `db.rs`.
+/// Matches the SQL `ORDER BY` in `db.rs`. `OrderedFloat` adapts the shared
+/// `frontmatter::rank` formula to the `Ord`-based comparator chain.
 fn rank(item: &TodoItem) -> OrderedFloat<f64> {
-    OrderedFloat(
-        item.sort_order
-            .or(item.priority.map(|p| p as f64))
-            .unwrap_or(graf::frontmatter::UNRANKED),
-    )
+    OrderedFloat(graf::frontmatter::rank(item.sort_order, item.priority))
 }
 
 /// K-way merge of pre-sorted task lists. Each input list must be sorted
