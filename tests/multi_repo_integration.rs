@@ -214,18 +214,18 @@ fn test_null_effective_date_partitioned_multi_repo() {
     assert_eq!(tasks[0]["tldr"], "Good");
     assert_eq!(tasks[0]["repo"], "work");
 
-    // combined.lint_errors: contains the partition error for the broken
-    // task, tagged with repo: "life".
+    // combined.lint_errors: the broken task is reported via its persisted
+    // lint state, tagged with repo: "life". The message names the rule it
+    // broke rather than the generic no-effective_date partition text.
     let lint_errors = result["lint_errors"].as_array().unwrap();
-    let partition_msg = "item has no effective_date (missing scheduling or completed date)";
     let found = lint_errors.iter().any(|e| {
         e["repo"].as_str() == Some("life")
-            && e["message"].as_str() == Some(partition_msg)
+            && e["message"].as_str() == Some("active task missing check_in_date or due_date")
             && e["path"].as_str() == Some("todo/broken.md")
     });
     assert!(
         found,
-        "expected partition lint_error for repo 'life' with path 'todo/broken.md'; got: {lint_errors:?}"
+        "expected lint_error for repo 'life' with path 'todo/broken.md'; got: {lint_errors:?}"
     );
 }
 
