@@ -41,7 +41,7 @@ impl GlobalId {
         }
         if domain
             .chars()
-            .any(|c| c.is_whitespace() || c == ':' || c == '#')
+            .any(|c| c.is_control() || c.is_whitespace() || c == ':' || c == '#')
         {
             bail!("global ID domain contains invalid characters: {s:?}");
         }
@@ -54,6 +54,9 @@ impl GlobalId {
         }
         if path.ends_with('/') {
             bail!("global ID path must not end with '/': {s:?}");
+        }
+        if path.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            bail!("global ID path contains invalid characters: {s:?}");
         }
 
         Ok(())
@@ -360,6 +363,20 @@ mod tests {
     #[test]
     fn global_id_invalid_trailing_slash() {
         assert!(GlobalId::new("example.com/life/").is_err());
+    }
+
+    #[test]
+    fn global_id_invalid_control_char_in_path() {
+        assert!(GlobalId::new("example.com/a\x1b[31mred").is_err());
+        assert!(GlobalId::new("example.com/a\nb").is_err());
+        assert!(GlobalId::new("example.com/a b").is_err());
+        assert!(GlobalId::new("example.com/a\tb").is_err());
+    }
+
+    #[test]
+    fn global_id_invalid_control_char_in_domain() {
+        assert!(GlobalId::new("e\x1b[31mvil.com/x").is_err());
+        assert!(GlobalId::new("evil\n.com/x").is_err());
     }
 
     #[test]

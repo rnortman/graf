@@ -222,24 +222,22 @@ fn run_check(args: CheckArgs) -> Result<()> {
             std::process::exit(1);
         }
     } else {
-        let mut errors = manifest.validate();
-        errors.extend(manifest.validate_repos());
-        let warnings = manifest.warnings();
-        for warning in &warnings {
+        let report = manifest.check_report();
+        for warning in &report.warnings {
             eprintln!("warning: {warning}");
         }
 
-        if errors.is_empty() {
+        if report.errors.is_empty() {
             eprintln!(
                 "Manifest OK ({} repos, {} domains)",
                 manifest.repo.len(),
                 manifest.domain.len()
             );
         } else {
-            for error in &errors {
+            for error in &report.errors {
                 eprintln!("error: {error}");
             }
-            bail!("{} validation error(s)", errors.len());
+            bail!("{} validation error(s)", report.errors.len());
         }
     }
 

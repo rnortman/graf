@@ -373,13 +373,11 @@ pub fn manifest_list_json(manifest: &AppManifest) -> serde_json::Value {
 
 /// Validate an `AppManifest` and return the standard check JSON format.
 pub fn manifest_check_json(manifest: &AppManifest) -> serde_json::Value {
-    let mut errors = manifest.validate();
-    errors.extend(manifest.validate_repos());
-    let warnings = manifest.warnings();
+    let report = manifest.check_report();
     serde_json::json!({
-        "ok": errors.is_empty(),
-        "errors": errors,
-        "warnings": warnings,
+        "ok": report.errors.is_empty(),
+        "errors": report.errors,
+        "warnings": report.warnings,
         "repos": manifest.repo.len(),
         "domains": manifest.domain.len(),
     })
