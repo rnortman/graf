@@ -1,0 +1,7 @@
+/target
+.venv/
+__pycache__/
+*.egg-info/
+.gitleaks.local.toml
+CLAUDE.local.md
+.claude/settings.local.json

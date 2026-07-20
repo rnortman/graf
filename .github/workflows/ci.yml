@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: make check
+
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+        run: |
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version | grep -qx "${GITLEAKS_VERSION}"
+
+      # --exit-code 0 makes leaks a reporting outcome, so a nonzero exit here
+      # means gitleaks itself malfunctioned.
+      - name: Scan tree
+        run: |
+          ./gitleaks dir . \
+            --config .gitleaks.toml \
+            --report-format json \
+            --report-path findings.json \
+            --no-banner \
+            --exit-code 0 \
+            --log-level error
+
+      # `ephemeral-reference` is enforced on diffs only: the existing backlog
+      # is grandfathered and burns down as lines are touched.
+      - name: Report
+        run: |
+          count=$(jq '[.[] | select(.RuleID != "ephemeral-reference")] | length' findings.json)
+          if [ "$count" -ne 0 ]; then
+            echo "::error::$count scrub finding(s) in tree scan"
+            jq -r '.[] | select(.RuleID != "ephemeral-reference")
+                   | "\(.File):\(.StartLine): [\(.RuleID)] \(.Description)"' findings.json
+            exit 1
+          fi
+          echo "clean (shared rules)"
