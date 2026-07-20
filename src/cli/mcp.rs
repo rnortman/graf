@@ -449,7 +449,8 @@ impl Tool for TodoQueryTool {
                 "repo": repo_property(),
                 "horizon_days": {
                     "type": "integer",
-                    "description": "Only include items up to N days in the future"
+                    "description": "Only include active items up to N days in the future \
+                                    and done/cancelled items completed within the last N days"
                 },
                 "include_done": {
                     "type": "boolean",

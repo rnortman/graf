@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rusqlite::params;
 use rusqlite::types::ToSql;
 
@@ -100,8 +100,11 @@ pub struct SyncResult {
 }
 
 pub struct TaskFilter {
-    /// Include items with effective_date <= reference_date + horizon_days.
-    /// None means no date ceiling: every item passes the date filter.
+    /// Symmetric date window: active items with
+    /// effective_date <= reference_date + horizon_days, and terminal
+    /// (done/cancelled) items with effective_date >= reference_date -
+    /// horizon_days, i.e. completed within the last `horizon_days` days.
+    /// None means no date filter at all: every item passes.
     pub horizon: Option<HorizonFilter>,
     /// Statuses to include.  Default: \[Todo, InProgress, Reminder\].
     /// When `include_done` is true, Done and Cancelled are appended.
@@ -297,24 +300,47 @@ impl Cache {
             qb.push_str(")");
         }
 
-        // Date filter: when a horizon is set, only include active items with an
-        // effective date within the window.  Active items without a date are
-        // excluded (they are invalid per lint rules but may exist in unchecked
-        // data).  Terminal items (done/cancelled) are exempt from the horizon
-        // filter — they sort by on_date/end_date, not scheduling dates.
-        // TODO(done-horizon): this returns ALL terminal items regardless of age.
+        // Date filter: a horizon is a symmetric window around the reference
+        // date.  Active items pass with an effective date at or before
+        // reference + days; active items without a date are excluded (they are
+        // invalid per lint rules but may exist in unchecked data).  Terminal
+        // items (done/cancelled) pass with an effective date at or after
+        // reference - days: their scheduling dates are stripped on completion,
+        // so the effective date is the completion date.  The terminal branch
+        // also admits a NULL effective date: such a row is a lint violation,
+        // and sync does not re-lint unchanged files, so letting it through is
+        // what surfaces it as a lint error rather than silently dropping it.
         if let Some(ref horizon) = filter.horizon {
-            let cutoff = horizon
+            let upper = horizon
                 .reference_date
                 .checked_add_signed(chrono::Duration::days(i64::from(horizon.days)))
                 .context("date overflow computing horizon cutoff")?;
-            let cutoff_str = cutoff.to_string();
+            let lower = horizon
+                .reference_date
+                .checked_sub_signed(chrono::Duration::days(i64::from(horizon.days)))
+                .context("date underflow computing terminal horizon lower bound")?;
 
-            let p = qb.push_param(cutoff_str);
+            // Both bounds are compared against stored dates as text, so they
+            // must render in the same zero-padded four-digit-year form.
+            // Outside years 0000-9999 chrono emits a sign-prefixed extended
+            // year, which breaks the byte-wise ordering the predicate relies
+            // on; reject such a horizon rather than return wrong rows.
+            if upper.year() > 9999 || lower.year() < 0 {
+                bail!(
+                    "horizon of {} days is out of range: window {lower}..{upper} \
+                     falls outside years 0000-9999",
+                    horizon.days
+                );
+            }
+
+            let p_upper = qb.push_param(upper.to_string());
+            let p_lower = qb.push_param(lower.to_string());
             // TODO(sql-terminal-status-strings)
             qb.push_str(&format!(
-                " AND (status IN ('done', 'cancelled') \
-                 OR ({EFF_DATE} IS NOT NULL AND {EFF_DATE} <= {p}))"
+                " AND ((status IN ('done', 'cancelled') \
+                 AND ({EFF_DATE} IS NULL OR {EFF_DATE} >= {p_lower})) \
+                 OR (status NOT IN ('done', 'cancelled') \
+                 AND {EFF_DATE} IS NOT NULL AND {EFF_DATE} <= {p_upper}))"
             ));
         }
 
@@ -1288,8 +1314,25 @@ mod tests {
         assert_eq!(tasks3.len(), 4); // past + today + future + unscheduled
     }
 
+    /// Query with a horizon and the default active statuses plus done/cancelled.
+    fn horizon_filter(reference: (i32, u32, u32), days: u32) -> TaskFilter {
+        TaskFilter {
+            horizon: Some(HorizonFilter {
+                reference_date: NaiveDate::from_ymd_opt(reference.0, reference.1, reference.2)
+                    .unwrap(),
+                days,
+            }),
+            include_done: true,
+            ..TaskFilter::default()
+        }
+    }
+
+    fn tldrs(tasks: &[TaskRow]) -> Vec<&str> {
+        tasks.iter().map(|t| t.tldr.as_str()).collect()
+    }
+
     #[test]
-    fn test_horizon_exempts_terminal_items() {
+    fn test_horizon_bounds_terminal_items() {
         let dir = create_test_repo();
         // Active item within horizon
         write_md(
@@ -1303,39 +1346,42 @@ mod tests {
             "future.md",
             "tldr: Future\nstatus: todo\ntentative_date: 2026-12-01",
         );
-        // Done item — scheduling dates stripped, on_date set.
-        // Without the horizon exemption this would be filtered out because
-        // its EFF_DATE (scheduling COALESCE) is NULL.
+        // Done item — scheduling dates stripped, on_date set — completed
+        // inside the lookback window.
         write_md(
             dir.path(),
             "done.md",
             "tldr: Done\nstatus: done\non_date: 2026-04-10",
         );
-        // Cancelled item — same situation.
+        // Cancelled item — terminated long before the lookback window.
         write_md(
             dir.path(),
             "cancelled.md",
             "tldr: Cancelled\nstatus: cancelled\non_date: 2026-03-01",
         );
+        // Cancelled item inside the lookback window: the terminal branch
+        // admits both terminal statuses, not just done.
+        write_md(
+            dir.path(),
+            "cancelled_recent.md",
+            "tldr: CancelledRecent\nstatus: cancelled\non_date: 2026-04-09",
+        );
+        // Anomalous future-dated completion: the terminal branch has a lower
+        // bound only, so it stays visible rather than being silently dropped.
+        write_md(
+            dir.path(),
+            "future_done.md",
+            "tldr: FutureDone\nstatus: done\non_date: 2026-05-20",
+        );
         commit_all(dir.path());
 
         let result = open_and_sync(dir.path()).unwrap();
 
-        // Horizon = today only: active items within window + all terminal items
-        let filter = TaskFilter {
-            horizon: Some(HorizonFilter {
-                reference_date: NaiveDate::from_ymd_opt(2026, 4, 11).unwrap(),
-                days: 0,
-            }),
-            statuses: vec![Status::Todo, Status::InProgress, Status::Reminder],
-            include_done: true,
-            labels: Vec::new(),
-            limit: None,
-        };
+        // Window 2026-04-06 .. 2026-04-16
+        let filter = horizon_filter((2026, 4, 11), 5);
         let tasks = result.cache.query_tasks(&filter).unwrap();
-        let tldrs: Vec<&str> = tasks.iter().map(|t| t.tldr.as_str()).collect();
+        let tldrs = tldrs(&tasks);
 
-        // Active within horizon + both terminal items (exempt from horizon)
         assert!(
             tldrs.contains(&"Active"),
             "active within horizon: {tldrs:?}"
@@ -1346,13 +1392,236 @@ mod tests {
         );
         assert!(
             tldrs.contains(&"Done"),
-            "done item exempt from horizon: {tldrs:?}"
+            "terminal item completed within lookback: {tldrs:?}"
         );
         assert!(
-            tldrs.contains(&"Cancelled"),
-            "cancelled item exempt from horizon: {tldrs:?}"
+            !tldrs.contains(&"Cancelled"),
+            "terminal item completed before lookback excluded: {tldrs:?}"
         );
-        assert_eq!(tldrs.len(), 3);
+        assert!(
+            tldrs.contains(&"CancelledRecent"),
+            "cancelled item terminated within lookback: {tldrs:?}"
+        );
+        assert!(
+            tldrs.contains(&"FutureDone"),
+            "future-dated completion stays visible: {tldrs:?}"
+        );
+        assert_eq!(tldrs.len(), 4);
+    }
+
+    #[test]
+    fn test_horizon_extreme_days_errors() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "active.md",
+            "tldr: Active\nstatus: todo\ntentative_date: 2026-04-11",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        // Past the representable date range: the upper bound overflows first.
+        let err = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), u32::MAX))
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("date overflow computing horizon cutoff"),
+            "attributable overflow error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_horizon_out_of_range_year_errors() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "active.md",
+            "tldr: Active\nstatus: todo\ntentative_date: 2026-04-11",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        // Representable, but the upper bound lands past year 9999, where the
+        // date no longer renders comparably against stored dates.  Returning
+        // zero active items instead of all of them would be a silent wrong
+        // answer, so this must fail.
+        let err = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 3_000_000))
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("out of range"),
+            "attributable range error: {rendered}"
+        );
+
+        // Mirror condition on the lower bound: a lookback past year 0.
+        let err = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 1_000_000))
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("out of range"),
+            "attributable range error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_horizon_terminal_lower_bound_is_inclusive() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "at_bound.md",
+            "tldr: AtBound\nstatus: done\non_date: 2026-04-06",
+        );
+        write_md(
+            dir.path(),
+            "before_bound.md",
+            "tldr: BeforeBound\nstatus: done\non_date: 2026-04-05",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        // Window lower bound = 2026-04-11 - 5 days = 2026-04-06
+        let tasks = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 5))
+            .unwrap();
+        assert_eq!(tldrs(&tasks), vec!["AtBound"]);
+    }
+
+    #[test]
+    fn test_horizon_zero_days_terminal_window() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "today.md",
+            "tldr: Today\nstatus: done\non_date: 2026-04-11",
+        );
+        write_md(
+            dir.path(),
+            "yesterday.md",
+            "tldr: Yesterday\nstatus: done\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        // days: 0 — the window collapses to the reference date itself.
+        let tasks = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 0))
+            .unwrap();
+        assert_eq!(tldrs(&tasks), vec!["Today"]);
+    }
+
+    #[test]
+    fn test_horizon_windows_range_completion_by_end_date() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "recent.md",
+            "tldr: Recent\nstatus: done\nstart_date: 2026-04-01\nend_date: 2026-04-09",
+        );
+        write_md(
+            dir.path(),
+            "old.md",
+            "tldr: Old\nstatus: done\nstart_date: 2026-02-01\nend_date: 2026-02-20",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        let tasks = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 5))
+            .unwrap();
+        assert_eq!(tldrs(&tasks), vec!["Recent"]);
+    }
+
+    #[test]
+    fn test_horizon_applies_to_explicit_done_status() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "recent.md",
+            "tldr: Recent\nstatus: done\non_date: 2026-04-10",
+        );
+        write_md(
+            dir.path(),
+            "old.md",
+            "tldr: Old\nstatus: done\non_date: 2026-01-10",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        // Explicit statuses, not include_done: the window still applies.
+        let filter = TaskFilter {
+            horizon: Some(HorizonFilter {
+                reference_date: NaiveDate::from_ymd_opt(2026, 4, 11).unwrap(),
+                days: 5,
+            }),
+            statuses: vec![Status::Done],
+            ..TaskFilter::default()
+        };
+        let tasks = result.cache.query_tasks(&filter).unwrap();
+        assert_eq!(tldrs(&tasks), vec!["Recent"]);
+    }
+
+    #[test]
+    fn test_horizon_admits_null_date_terminal_row() {
+        let dir = create_test_repo();
+        // Lint violation: terminal with no completion date.  It must still
+        // pass the SQL filter so the layer above can report it.
+        write_md(dir.path(), "nodate.md", "tldr: NoDate\nstatus: done");
+        write_md(
+            dir.path(),
+            "old.md",
+            "tldr: Old\nstatus: done\non_date: 2026-01-10",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        let tasks = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 5))
+            .unwrap();
+        assert_eq!(tldrs(&tasks), vec!["NoDate"]);
+        assert!(tasks[0].effective_date.is_none());
+    }
+
+    #[test]
+    fn test_horizon_windows_terminal_item_by_tentative_date() {
+        let dir = create_test_repo();
+        // Lint tolerates a retained tentative_date on a terminal item; it wins
+        // the effective-date COALESCE, so it is what the window applies to.
+        write_md(
+            dir.path(),
+            "old_completion.md",
+            "tldr: OldCompletion\nstatus: done\non_date: 2026-01-10\ntentative_date: 2026-04-09",
+        );
+        write_md(
+            dir.path(),
+            "recent_completion.md",
+            "tldr: RecentCompletion\nstatus: done\non_date: 2026-04-10\ntentative_date: 2026-01-09",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+
+        let tasks = result
+            .cache
+            .query_tasks(&horizon_filter((2026, 4, 11), 5))
+            .unwrap();
+        assert_eq!(tldrs(&tasks), vec!["OldCompletion"]);
     }
 
     #[test]

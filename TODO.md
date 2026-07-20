@@ -16,10 +16,6 @@ The SQL `ORDER BY` in `db.rs` and the Rust `todo_sort_cmp()` in `cli/mod.rs` enc
 
 `AppConfig::default_path()` and `AppManifest::default_path()` both implement the same XDG config directory logic (`XDG_CONFIG_HOME` → fallback `~/.config`). Extract a shared `graf_config_dir()` helper when a third caller appears.
 
-## `done-horizon`
-
-`--include-done --horizon N` exempts all terminal items from the horizon filter, returning every done/cancelled task regardless of when it was completed. For a user with many historical completed items this could produce a large result set. Consider adding a separate horizon for terminal items — e.g., only include items completed within the last N days — or filtering terminal items by `on_date`/`end_date` relative to the horizon cutoff. See the horizon exemption in `db.rs` `query_tasks()`.
-
 ## `sql-terminal-status-strings`
 
 The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and horizon WHERE clauses of `db.rs`. These are hardcoded string literals that must stay in sync with `Status::Done` and `Status::Cancelled` serialization. If a new terminal status were added, these would need manual updates found only by text search. Consider building the SQL fragment from `Status::is_terminal()` variants or a shared constant.

@@ -31,6 +31,10 @@ use crate::identity::{GlobalId, Slug};
 /// current sync pass are merged in on top; duplicates across the two
 /// sources collapse.
 ///
+/// A horizon windows terminal items by completion date; a terminal item with
+/// no completion date still passes the SQL filter and surfaces here as a lint
+/// error.
+///
 /// Invariant: every item in `tasks` has a non-null `effective_date`. Rows
 /// whose `effective_date` resolves to NULL in the cache (indicating a
 /// scheduling-date lint violation) are partitioned into `lint_errors`
@@ -104,7 +108,8 @@ pub struct QueryOptions {
     pub repo_slug: Option<Slug>,
     /// Sharing domain to tag onto results (when operating with manifest).
     pub repo_domain: Option<GlobalId>,
-    /// When set, only include items with effective_date <= today + N days.
+    /// When set, only include active items with effective_date <= today + N
+    /// days and done/cancelled items completed within the last N days.
     /// None means no date filtering (the default).
     pub horizon_days: Option<u32>,
     pub include_done: bool,
@@ -2580,6 +2585,55 @@ mod tests {
         assert_eq!(fm.context_link.as_deref(), Some("http://example.com/a#b"));
         assert_eq!(fm.links, vec!["docs/x: y # z.md"]);
         assert_eq!(fm.blocked_by, vec!["todo/dep: thing.md"]);
+    }
+
+    #[test]
+    fn todo_query_horizon_reports_null_date_terminal_row_as_lint_error() {
+        let dir = setup_repo();
+        let today = Clock::from_env().today();
+        let recent = today - chrono::Duration::days(1);
+        let old = today - chrono::Duration::days(300);
+
+        write_task(
+            &dir,
+            "todo/nodate.md",
+            "---\ntldr: NoDate\nstatus: done\n---\n",
+        );
+        write_task(
+            &dir,
+            "todo/recent.md",
+            &format!("---\ntldr: Recent\nstatus: done\non_date: {recent}\n---\n"),
+        );
+        write_task(
+            &dir,
+            "todo/old.md",
+            &format!("---\ntldr: Old\nstatus: done\non_date: {old}\n---\n"),
+        );
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "-m", "tasks"]);
+
+        let result = todo_query(&QueryOptions {
+            repo_dir: dir.path().to_path_buf(),
+            repo_slug: None,
+            repo_domain: None,
+            horizon_days: Some(5),
+            include_done: false,
+            statuses: vec![Status::Done],
+            labels: vec![],
+            limit: None,
+        })
+        .unwrap();
+
+        let tldrs: Vec<&str> = result.tasks.iter().map(|t| t.tldr.as_str()).collect();
+        assert_eq!(tldrs, vec!["Recent"], "window keeps only recent completion");
+        assert!(
+            result
+                .lint_errors
+                .iter()
+                .any(|e| e.path.ends_with("nodate.md")),
+            "null-date terminal row still surfaces as a lint error: {:?}",
+            result.lint_errors
+        );
     }
 
     #[test]
