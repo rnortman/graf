@@ -237,9 +237,11 @@ fn test_todo_query_default_no_horizon() {
 }
 
 /// A task missing both `check_in_date` and `due_date` has null
-/// effective_date in the cache. `todo_query` must partition such rows
-/// into `lint_errors` with the synthesized message, never into `tasks`
-/// — see the invariant on `TodoQueryResult`.
+/// effective_date in the cache. Such rows stay out of `tasks` (the
+/// `TodoQueryResult` invariant) and are reported in `lint_errors` via
+/// their persisted lint state, which names the rule they broke. The
+/// generic partition message is a last resort and must not appear when
+/// persisted state exists.
 #[test]
 fn test_null_effective_date_partitioned_to_lint_errors() {
     let tmp = tempfile::tempdir().unwrap();
@@ -269,23 +271,27 @@ fn test_null_effective_date_partitioned_to_lint_errors() {
         "null-effective_date row must not appear in tasks: {tasks:?}"
     );
 
-    // It must appear in lint_errors with the synthesized partition message.
+    // It must appear in lint_errors exactly once, naming the rule it broke.
     let lint_errors = result["lint_errors"].as_array().unwrap();
-    let partition_msg = "item has no effective_date (missing scheduling or completed date)";
-    let found = lint_errors
+    let broken: Vec<&Value> = lint_errors
         .iter()
-        .any(|e| e["path"] == "todo/no-dates.md" && e["message"].as_str() == Some(partition_msg));
-    assert!(
-        found,
-        "expected partition lint_error with message {partition_msg:?} for todo/no-dates.md; got: {lint_errors:?}"
+        .filter(|e| e["path"] == "todo/no-dates.md")
+        .collect();
+    assert_eq!(
+        broken.len(),
+        1,
+        "expected exactly one lint_error for todo/no-dates.md; got: {broken:?}"
+    );
+    assert_eq!(
+        broken[0]["message"].as_str(),
+        Some("active task missing check_in_date or due_date")
     );
 }
 
-/// Partition applies identically to terminal (done/cancelled) items
-/// that fail their own scheduling-date lint rule ("done/cancelled item
-/// missing on_date or end_date"). The `task_row_to_item` conversion is
-/// status-agnostic — any null-`effective_date` row is partitioned — so
-/// both classes of lint violation surface through the same channel.
+/// Terminal (done/cancelled) items that fail their own scheduling-date
+/// lint rule are reported the same way. The persisted set is scanned
+/// independently of the query's status filter, so the violation surfaces
+/// even though the item is out of query scope without `--include-done`.
 #[test]
 fn test_null_effective_date_partition_for_terminal_status() {
     let tmp = tempfile::tempdir().unwrap();
@@ -300,15 +306,9 @@ fn test_null_effective_date_partition_for_terminal_status() {
         "add broken done",
     );
 
-    // --include-done so the done item enters the query scope.
+    // Default status filter: the done item is NOT in query scope.
     let output = graf_cmd()
-        .args([
-            "todo",
-            "--json",
-            "--include-done",
-            "--repo",
-            repo.to_str().unwrap(),
-        ])
+        .args(["todo", "--json", "--repo", repo.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -319,37 +319,31 @@ fn test_null_effective_date_partition_for_terminal_status() {
     let tasks = result["tasks"].as_array().unwrap();
     assert!(
         tasks.iter().all(|t| t["path"] != "todo/broken-done.md"),
-        "null-effective_date terminal row must not appear in tasks: {tasks:?}"
+        "terminal row must not appear in tasks under the default filter: {tasks:?}"
     );
 
-    // It must appear in lint_errors with the same synthesized message as
-    // for active items (the partition message is status-agnostic).
+    // It is nonetheless reported, with the rule's own message.
     let lint_errors = result["lint_errors"].as_array().unwrap();
-    let partition_msg = "item has no effective_date (missing scheduling or completed date)";
     let found = lint_errors.iter().any(|e| {
-        e["path"] == "todo/broken-done.md" && e["message"].as_str() == Some(partition_msg)
+        e["path"] == "todo/broken-done.md"
+            && e["message"].as_str() == Some("done/cancelled item missing on_date or end_date")
     });
     assert!(
         found,
-        "expected partition lint_error for todo/broken-done.md; got: {lint_errors:?}"
+        "expected lint_error for todo/broken-done.md; got: {lint_errors:?}"
     );
 }
 
-/// Running the query twice without changing files still partitions the
-/// null-date row, and on the second pass the partition is the ONLY
-/// source of the error — sync's incremental pass does not re-lint
-/// already-committed clean files. This guards the invariant "every
-/// null-effective_date row in the cache produces a `TodoError` on every
-/// call, regardless of whether the current sync pass re-linted that file."
+/// Running the query twice without changing files reports the same
+/// rule-specific error both times, exactly once per pass.
 ///
 /// Mechanics: the graf cache persists at `<repo>/.graf.db` between CLI
-/// invocations. Pass 1 cold-starts with no cache, triggering `do_reindex`
-/// which walks every file and produces lint errors in `sync.errors`. Pass 2
-/// finds the cache populated and `last_indexed_commit == HEAD`, so the
-/// incremental sync skips both reconcile-dirty (no dirty rows) and the
-/// commit-diff step — `sync.errors` is empty. If the partition at
-/// `todo_query`'s response-building layer didn't exist, pass 2 would
-/// emit no error for the broken file at all.
+/// invocations. Pass 1 cold-starts with no cache, triggering `do_reindex`,
+/// which lints every file and persists the messages. Pass 2 finds the cache
+/// populated and `last_indexed_commit == HEAD`, so the incremental sync
+/// skips both reconcile-dirty (no dirty rows) and the commit-diff step —
+/// `sync.errors` is empty and the persisted set is the only source. This is
+/// the regression the persisted lint state exists to prevent.
 #[test]
 fn test_null_effective_date_partitioned_across_queries() {
     let tmp = tempfile::tempdir().unwrap();
@@ -362,7 +356,8 @@ fn test_null_effective_date_partitioned_across_queries() {
         "add lint-dirty",
     );
 
-    let partition_msg = "item has no effective_date (missing scheduling or completed date)";
+    let rule_msg = "active task missing check_in_date or due_date";
+    let generic_msg = "item has no effective_date (missing scheduling or completed date)";
 
     for pass in 1..=2 {
         let output = graf_cmd()
@@ -385,33 +380,24 @@ fn test_null_effective_date_partitioned_across_queries() {
             .filter(|e| e["path"] == "todo/no-dates.md")
             .collect();
 
-        let has_partition = broken_errors
-            .iter()
-            .any(|e| e["message"].as_str() == Some(partition_msg));
-        assert!(
-            has_partition,
-            "pass {pass}: expected partition lint_error for todo/no-dates.md; got: {lint_errors:?}"
+        // Exactly one error, naming the rule, on both passes. Pass 1 has it
+        // from sync and the persisted set at once — dedup collapses them.
+        assert_eq!(
+            broken_errors.len(),
+            1,
+            "pass {pass}: expected exactly one lint_error for todo/no-dates.md; got: {broken_errors:?}"
         );
-
-        if pass == 2 {
-            // Invariant test: on the second pass, sync does NOT re-lint
-            // already-committed files, so the only error source for the
-            // broken file is the partition at the response-building
-            // layer. The original lint rule message "active task missing
-            // check_in_date or due_date" must NOT appear — if it did, it
-            // would mean sync re-linted (and the partition would be
-            // redundant rather than load-bearing).
-            let sync_lint_leaked = broken_errors.iter().any(|e| {
-                e["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("missing check_in_date"))
-            });
-            assert!(
-                !sync_lint_leaked,
-                "pass 2: sync should not re-lint clean committed files; \
-                 partition should be the ONLY source of the error. Got: {broken_errors:?}"
-            );
-        }
+        assert_eq!(
+            broken_errors[0]["message"].as_str(),
+            Some(rule_msg),
+            "pass {pass}: wrong message"
+        );
+        assert!(
+            !lint_errors
+                .iter()
+                .any(|e| e["message"].as_str() == Some(generic_msg)),
+            "pass {pass}: generic message must not appear when persisted state exists"
+        );
     }
 }
 
@@ -990,6 +976,13 @@ fn test_todo_done_recurring_advances() {
         "---\ntldr: Recurring Task\nstatus: todo\npriority: 3\ncheck_in_date: '2026-04-06'\nrrule: \"FREQ=WEEKLY\"\ntentative_date: '2026-04-06'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n\nSome instructions.\n",
     ).unwrap();
 
+    // Positive control for the lint-freshness assertion below: a file that
+    // must appear under the same path filter.
+    std::fs::write(
+        repo.join("todo/known-bad.md"),
+        "---\ntldr: Known Bad\nstatus: done\npriority: 3\ncheck_in_date: '2026-04-01'\non_date: '2026-04-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+    ).unwrap();
+
     let output = graf_cmd()
         .args([
             "todo",
@@ -1024,6 +1017,40 @@ fn test_todo_done_recurring_advances() {
     assert!(content.contains("recurrence:"));
     assert!(content.contains("completion_log:"));
     assert!(content.contains("Some instructions.")); // body preserved
+
+    // The advanced shape is lint-clean: persisted lint state after the
+    // mutation carries no entry for the file.
+    let output = graf_cmd()
+        .args([
+            "todo",
+            "--json",
+            "--include-done",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let messages_for = |path: &str| -> Vec<&str> {
+        result["lint_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"] == path)
+            .filter_map(|e| e["message"].as_str())
+            .collect()
+    };
+    let control = messages_for("todo/known-bad.md");
+    assert!(
+        control.contains(&"done/cancelled item has check_in_date set"),
+        "positive control missing — the path filter no longer matches: {control:?}"
+    );
+    let messages = messages_for("todo/recurring.md");
+    assert!(
+        messages.is_empty(),
+        "recurring advance left persisted lint errors: {messages:?}"
+    );
 }
 
 #[test]
@@ -3677,5 +3704,362 @@ fn test_todo_cancel_with_today_override() {
     assert!(
         !content.contains("on_date: '2026-04-17'"),
         "cancel on_date has buggy UTC date:\n{content}",
+    );
+}
+
+/// A violating file dirty in the working tree is linted by the current sync
+/// pass AND carried in the persisted set. The two must collapse to a single
+/// reported error rather than double-reporting.
+#[test]
+fn test_lint_error_deduped_when_file_dirty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = setup_repo(tmp.path());
+
+    write_and_commit(
+        &repo,
+        "todo/bad.md",
+        "---\ntldr: Bad\nstatus: done\non_date: '2026-04-10'\ncheck_in_date: '2026-05-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+        "add violating file",
+    );
+
+    // Prime the cache so the violation is persisted.
+    let primed = graf_cmd()
+        .args(["todo", "--json", "--repo", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(primed.status.success());
+
+    // Now dirty the file in the working tree, keeping the same violation.
+    std::fs::write(
+        repo.join("todo/bad.md"),
+        "---\ntldr: Bad Edited\nstatus: done\non_date: '2026-04-10'\ncheck_in_date: '2026-05-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-02T00:00:00Z'\n---\n",
+    )
+    .unwrap();
+
+    let output = graf_cmd()
+        .args(["todo", "--json", "--repo", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+
+    let lint_errors = result["lint_errors"].as_array().unwrap();
+    let occurrences = lint_errors
+        .iter()
+        .filter(|e| {
+            e["path"] == "todo/bad.md"
+                && e["message"].as_str() == Some("done/cancelled item has check_in_date set")
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "persisted and current-pass errors must collapse; got: {lint_errors:?}"
+    );
+}
+
+/// A horizon-bounded query excludes the violating row from `tasks`, but the
+/// persisted set is scanned independently of the filter, so the violation is
+/// still reported.
+#[test]
+fn test_horizon_does_not_silence_lint_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = setup_repo(tmp.path());
+
+    write_and_commit(
+        &repo,
+        "todo/no-dates.md",
+        "---\ntldr: No Dates Task\nstatus: todo\npriority: 3\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+        "add lint-dirty",
+    );
+
+    // Two passes: the second is quiescent, with no sync errors to fall back on.
+    for pass in 1..=2 {
+        let output = graf_cmd()
+            .args([
+                "todo",
+                "--json",
+                "--horizon",
+                "7",
+                "--repo",
+                repo.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "pass {pass} failed");
+        let result: Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+
+        let tasks = result["tasks"].as_array().unwrap();
+        assert!(
+            tasks.iter().all(|t| t["path"] != "todo/no-dates.md"),
+            "pass {pass}: null-date row must not appear in tasks"
+        );
+
+        let lint_errors = result["lint_errors"].as_array().unwrap();
+        let found = lint_errors.iter().any(|e| {
+            e["path"] == "todo/no-dates.md"
+                && e["message"].as_str() == Some("active task missing check_in_date or due_date")
+        });
+        assert!(
+            found,
+            "pass {pass}: horizon must not silence the violation; got: {lint_errors:?}"
+        );
+    }
+}
+
+/// Statusless knowledge-base docs are never returned by `query_tasks`, but
+/// their date-exclusivity violations still reach `lint_errors` through the
+/// persisted set.
+#[test]
+fn test_non_task_doc_lint_surfaces_in_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = setup_repo(tmp.path());
+
+    write_and_commit(
+        &repo,
+        "kb-entry.md",
+        "---\ntldr: KB Entry\nend_date: '2026-04-15'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\nBody.\n",
+        "add kb entry",
+    );
+
+    let output = graf_cmd()
+        .args(["todo", "--json", "--repo", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+
+    let tasks = result["tasks"].as_array().unwrap();
+    assert!(
+        tasks.iter().all(|t| t["path"] != "kb-entry.md"),
+        "statusless doc must not appear in tasks; got: {tasks:?}"
+    );
+
+    let lint_errors = result["lint_errors"].as_array().unwrap();
+    let found = lint_errors.iter().any(|e| {
+        e["path"] == "kb-entry.md" && e["message"].as_str() == Some("end_date requires start_date")
+    });
+    assert!(
+        found,
+        "statusless doc's violation must surface; got: {lint_errors:?}"
+    );
+}
+
+/// The mutation paths (`add`, `schedule`, `done`, `cancel`) write frontmatter
+/// through `upsert_doc`, which recomputes persisted lint state. A mutation
+/// that wrote a lint-tripping shape would leave a violation reported on every
+/// later query, so each family asserts a clean path after mutating.
+///
+/// A deliberately violating file provides the positive control: the same
+/// filter must match something, otherwise the clean-path assertions are
+/// vacuously true.
+#[test]
+fn test_mutation_paths_leave_no_persisted_lint_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = setup_repo(tmp.path());
+
+    write_and_commit(
+        &repo,
+        "todo/known-bad.md",
+        "---\ntldr: Known Bad\nstatus: done\npriority: 3\ncheck_in_date: '2026-04-01'\non_date: '2026-04-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+        "add known-bad",
+    );
+
+    let lint_errors_for = |path: &str| -> Vec<Value> {
+        let output = graf_cmd()
+            .args([
+                "todo",
+                "--json",
+                "--include-done",
+                "--repo",
+                repo.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        result["lint_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"] == path)
+            .cloned()
+            .collect()
+    };
+
+    let run = |args: &[&str]| {
+        let mut full = vec!["todo"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&["--repo", repo.to_str().unwrap()]);
+        let output = graf_cmd().args(&full).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // Positive control: the filter and the path format it matches on both
+    // work, so the emptiness assertions below mean something.
+    let control: Vec<String> = lint_errors_for("todo/known-bad.md")
+        .iter()
+        .filter_map(|e| e["message"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        control
+            .iter()
+            .any(|m| m == "done/cancelled item has check_in_date set"),
+        "positive control missing — the path filter no longer matches: {control:?}"
+    );
+
+    run(&[
+        "add",
+        "todo/fresh.md",
+        "Fresh Task",
+        "--priority",
+        "2",
+        "--check-in",
+        "2026-05-01",
+    ]);
+    let after_add = lint_errors_for("todo/fresh.md");
+    assert!(
+        after_add.is_empty(),
+        "add wrote a lint-tripping shape: {after_add:?}"
+    );
+
+    run(&["schedule", "todo/fresh.md", "2026-06-01"]);
+    let after_schedule = lint_errors_for("todo/fresh.md");
+    assert!(
+        after_schedule.is_empty(),
+        "schedule wrote a lint-tripping shape: {after_schedule:?}"
+    );
+
+    run(&["done", "todo/fresh.md", "--completion-date", "2026-06-01"]);
+    let after_done = lint_errors_for("todo/fresh.md");
+    assert!(
+        after_done.is_empty(),
+        "done wrote a lint-tripping shape: {after_done:?}"
+    );
+
+    run(&[
+        "add",
+        "todo/cancel-me.md",
+        "Cancel Me",
+        "--priority",
+        "2",
+        "--check-in",
+        "2026-05-01",
+    ]);
+    run(&["cancel", "todo/cancel-me.md"]);
+    let after_cancel = lint_errors_for("todo/cancel-me.md");
+    assert!(
+        after_cancel.is_empty(),
+        "cancel wrote a lint-tripping shape: {after_cancel:?}"
+    );
+}
+
+/// Anchored terminal completion preserves `check_in_date` and the recurrence
+/// block, frozen at the final occurrence. `check_rules` exempts that shape,
+/// so a real drive to exhaustion leaves no persisted lint errors.
+#[test]
+fn test_anchored_exhaustion_leaves_no_persisted_lint_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = setup_repo(tmp.path());
+
+    write_and_commit(
+        &repo,
+        "todo/anchored-finite.md",
+        "---\ntldr: Anchored Finite\nstatus: todo\npriority: 3\ncheck_in_date: '2026-01-03'\nrrule: \"FREQ=WEEKLY;BYDAY=SA;UNTIL=20260228T000000Z\"\ntentative_date: '2026-01-03'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+        "add anchored finite",
+    );
+
+    // Positive control for the lint assertion below: a file that must appear
+    // under the same path filter.
+    write_and_commit(
+        &repo,
+        "todo/known-bad.md",
+        "---\ntldr: Known Bad\nstatus: done\npriority: 3\ncheck_in_date: '2026-04-01'\non_date: '2026-04-01'\ncreated: '2025-01-01T00:00:00Z'\nupdated: '2025-01-01T00:00:00Z'\n---\n",
+        "add known-bad",
+    );
+
+    let output = graf_cmd()
+        .args([
+            "todo",
+            "--json",
+            "done",
+            "todo/anchored-finite.md",
+            "--completion-date",
+            "2026-05-01",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = graf_cmd()
+        .args([
+            "todo",
+            "--json",
+            "--include-done",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let messages_for = |path: &str| -> Vec<&str> {
+        result["lint_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"] == path)
+            .filter_map(|e| e["message"].as_str())
+            .collect()
+    };
+    let control = messages_for("todo/known-bad.md");
+    assert!(
+        control.contains(&"done/cancelled item has check_in_date set"),
+        "positive control missing — the path filter no longer matches: {control:?}"
+    );
+    let messages = messages_for("todo/anchored-finite.md");
+
+    assert!(
+        messages.is_empty(),
+        "frozen series must be lint-clean; got: {messages:?}"
+    );
+
+    // The lint gate no longer blocks mutations on the frozen file: `done`
+    // reaches its own terminal-status rejection.
+    let output = graf_cmd()
+        .args([
+            "todo",
+            "--json",
+            "done",
+            "todo/anchored-finite.md",
+            "--completion-date",
+            "2026-05-02",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let resp: Value = serde_json::from_str(&stdout).unwrap();
+    let reason = resp["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("already has terminal status"),
+        "expected the terminal-status rejection, not the lint gate; got: {reason}"
     );
 }

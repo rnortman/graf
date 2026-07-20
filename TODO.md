@@ -36,12 +36,27 @@ The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and hor
 
 `maybe_migrate_legacy` in `src/migrate.rs` rewrites legacy frontmatter without validating that the `rrule` string is parseable. A file with a broken `rrule` (e.g. `FREQ=BOGUS`) migrates into the nested shape still broken; runtime breakage surfaces only when `compute_next_occurrence` is invoked. The intended behavior is that a `FREQ=BOGUS` rrule records a `FileError` and leaves the file untouched, but neither lint nor parse validates rrule syntax elsewhere, so migration isn't the natural place to add enforcement. Consider adding an rrule-syntax lint rule that applies uniformly; migration would then surface the issue via the post-rewrite lint pass.
 
-## `ephemeral-lint-errors`
+## `persist-parse-errors`
 
-`TodoQueryResult.lint_errors` is populated from the current sync pass's `sync.errors`, which only contains errors for files the sync actually re-linted (step 5 working-tree changes, step 4 HEAD diff, step 2 reconcile-dirty). A file with a lint violation that was committed long ago and hasn't been touched since gets linted once when indexed; on subsequent queries its lint error is not re-emitted — the error message is never persisted in the cache.
+Lint-rule violations are persisted per-doc in `docs.lint_errors`, so `graf todo` reports them on every query. Parse and validation failures are not: a file that fails to parse has its cache row deleted (`reconcile_dirty` and `apply_changed_files` in `src/db.rs`), so its error is reported only on the sync pass that touched it — the same ephemerality that persisted lint state fixed for lint rules.
 
-Null-`effective_date` rows are exempt from this silence because `todo_query` partitions them from `tasks` into `lint_errors` at the response-building layer on every call (see the invariant on `TodoQueryResult` and the test `test_null_effective_date_partitioned_across_queries`). But other lint rules (e.g. terminal item with `check_in_date` set, `end_date` without `start_date`) still exhibit the silence.
+Persisting these means keeping rows for files with no valid frontmatter, which have no `tldr` and no dates: either a nullable-everything doc row or a separate errors table. That is a schema question of its own, and was out of scope for the lint-persistence work. Until then, `graf lint` remains the way to surface standing parse failures.
 
-`graf lint` runs a full-repo scan and is the authoritative way to surface all current violations. `graf todo`'s `lint_errors` is therefore a "what changed in this sync pass" channel plus the null-date partition, not a comprehensive "what's wrong in the repo" report.
 
-Fix options: (1) persist lint error messages in the cache (column on `docs` or a side table), refresh the set on each file re-lint; (2) re-run `check_rules` at query time against every cache row (likely too expensive for large repos); (3) document the current semantics and treat `graf lint` as the authoritative surface. Option (1) has the best cost/value ratio and would let `graf todo`'s `lint_errors` become trustworthy in steady state.
+## `frozen-series-effective-date`
+
+`EFF_DATE` in `src/db.rs` resolves an item's effective date as
+`COALESCE(tentative_date, check_in_date, on_date, end_date, due_date)`, on the
+premise that terminal items have their scheduling dates stripped and so sort
+and report by completion date. A frozen series breaks that premise: anchored
+exhaustion (`anchored_terminal_completion` in `src/todo.rs`) preserves
+`check_in_date` frozen at the final occurrence, so an exhausted series reports
+and sorts by that occurrence rather than by its `on_date` completion date —
+off by however long completion lagged the last occurrence.
+
+Which date such an item should show is a product question against the phase-2
+freeze semantics (PRD-data-model §2), not a local bug fix: either the terminal
+branch of the effective-date expression prefers `on_date`/`end_date` (a schema
+bump plus an index review, since `EFF_DATE` must stay textually identical
+across the schema index, SELECT, WHERE and ORDER BY), or the final-occurrence
+ordering is declared intended and documented as such.

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -20,22 +21,20 @@ use crate::identity::{GlobalId, Slug};
 // Query
 // ---------------------------------------------------------------------------
 
-/// Result of a todo query: tasks + any lint errors found during sync.
+/// Result of a todo query: tasks + the repo's lint errors.
+///
+/// `lint_errors` is comprehensive, not a "what changed this pass" channel:
+/// it is seeded from the lint state persisted on every cached doc
+/// (`db::Cache::all_lint_errors`), so violations committed long ago are
+/// reported on every query, under any status filter or horizon, and for
+/// docs that are not tasks at all. Parse and validation failures from the
+/// current sync pass are merged in on top; duplicates across the two
+/// sources collapse.
 ///
 /// Invariant: every item in `tasks` has a non-null `effective_date`. Rows
 /// whose `effective_date` resolves to NULL in the cache (indicating a
 /// scheduling-date lint violation) are partitioned into `lint_errors`
-/// instead of `tasks`. This holds regardless of whether the current
-/// sync pass re-linted the violating file.
-///
-/// Horizon note: when `horizon_days` is set, the SQL WHERE clause in
-/// `db::Cache::query_tasks` filters out active items with NULL
-/// `effective_date` before they reach the partition (terminal items
-/// bypass the horizon filter). The partition only observes null-date
-/// rows that the DB layer actually returned. Brenn's todo query does
-/// not set a horizon so the invariant holds end-to-end there; callers
-/// that set a horizon should understand that null-date active items
-/// are silent under horizon-bounded queries by design.
+/// instead of `tasks`.
 #[derive(Debug, Serialize)]
 pub struct TodoQueryResult {
     /// Sharing domains that contributed results (for contamination tracking).
@@ -142,25 +141,51 @@ pub fn todo_query(opts: &QueryOptions) -> Result<TodoQueryResult> {
     let slug = &opts.repo_slug;
     let domain = &opts.repo_domain;
 
+    // lint_errors is built from three sources against one dedup set: the
+    // persisted per-doc lint state (comprehensive), this pass's sync errors
+    // (parse/validation failures, plus lint messages that duplicate the ones
+    // just persisted), and the null-effective_date partition below.
+    let mut lint_errors: Vec<TodoError> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut paths_with_lint: HashSet<String> = HashSet::new();
+
+    // Single emission point for every source, so the dedup key can never
+    // diverge between them.
+    let mut emit = |path: String, message: String| {
+        if seen.insert((path.clone(), message.clone())) {
+            lint_errors.push(TodoError {
+                path,
+                repo: slug.clone(),
+                message,
+            });
+        }
+    };
+
+    for e in sync.cache.all_lint_errors()? {
+        let path = e.path.display().to_string();
+        paths_with_lint.insert(path.clone());
+        emit(path, e.message);
+    }
+
+    for e in sync.errors {
+        emit(e.path.display().to_string(), e.message);
+    }
+
     // Partition rows: those with a resolved effective_date become TodoItems;
     // those with null effective_date (a scheduling-date lint violation in
-    // the stored data) become synthesized lint_errors. See
-    // TodoQueryResult's invariant doc.
+    // the stored data) stay out of `tasks`. Such a row always carries a
+    // persisted lint message naming the specific rule it broke, so the
+    // generic synthesized message is only emitted if that state is somehow
+    // absent — reporting something beats reporting nothing.
     let mut tasks = Vec::with_capacity(rows.len());
-    let mut lint_errors: Vec<TodoError> = sync
-        .errors
-        .into_iter()
-        .map(|e| TodoError {
-            path: e.path.display().to_string(),
-            repo: slug.clone(),
-            message: e.message,
-        })
-        .collect();
-
     for row in rows {
         match task_row_to_item(row, slug.clone(), domain.clone()) {
             Ok(item) => tasks.push(item),
-            Err(err) => lint_errors.push(err),
+            Err(err) => {
+                if !paths_with_lint.contains(&err.path) {
+                    emit(err.path, err.message);
+                }
+            }
         }
     }
 
@@ -1100,7 +1125,9 @@ fn anchored_terminal_completion(
         FieldMutation::Remove {
             field: Field::TentativeDate,
         },
-        // Preserve: CheckInDate, DueDate, Recurrence (+ legacy Rrule).
+        // Preserve: CheckInDate, DueDate, Recurrence (+ legacy Rrule) — frozen
+        // at the final occurrence.  `lint::check_rules` exempts this shape
+        // (recurrence + non-empty completion log) from its terminal rules.
         // Clear sort_order: terminal tasks rank by on_date in the query
         // layer, and the only writer of sort_order is `todo_reorder`.
         FieldMutation::Remove {

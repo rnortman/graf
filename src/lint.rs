@@ -45,52 +45,90 @@ pub fn lint_result_to_json(result: &LintResult) -> Value {
     })
 }
 
+const MSG_ON_AND_START: &str =
+    "on_date and start_date cannot both be set (use start_date + end_date for ranges)";
+const MSG_ON_AND_END: &str =
+    "on_date and end_date cannot both be set (use start_date + end_date for ranges)";
+const MSG_END_NEEDS_START: &str = "end_date requires start_date";
+const MSG_TERMINAL_NO_DATE: &str = "done/cancelled item missing on_date or end_date";
+const MSG_TERMINAL_CHECK_IN: &str = "done/cancelled item has check_in_date set";
+const MSG_TERMINAL_RRULE: &str =
+    "done/cancelled item has rrule set (remove rrule to stop recurrence)";
+const MSG_ACTIVE_NO_DATE: &str = "active task missing check_in_date or due_date";
+
+/// Roster of every message `check_rules` can emit.  The rules reference the
+/// `MSG_*` constants directly and emit through `emit`, which asserts
+/// membership here, so an unregistered message fails in every debug/test run
+/// regardless of fixture coverage.  The message-snapshot test checks its
+/// fixtures against this array in the other direction: a message listed here
+/// that no fixture trips fails the test rather than passing unnoticed.
+const RULE_MESSAGES: [&str; 7] = [
+    MSG_ON_AND_START,
+    MSG_ON_AND_END,
+    MSG_END_NEEDS_START,
+    MSG_TERMINAL_NO_DATE,
+    MSG_TERMINAL_CHECK_IN,
+    MSG_TERMINAL_RRULE,
+    MSG_ACTIVE_NO_DATE,
+];
+
+/// Single emit point for lint violations.  Every message must be declared in
+/// `RULE_MESSAGES`; the assertion makes an undeclared one fail loudly in
+/// debug and test builds instead of depending on a fixture happening to trip
+/// it.
+fn emit(errors: &mut Vec<FileError>, path: &Path, msg: &'static str) {
+    debug_assert!(
+        RULE_MESSAGES.contains(&msg),
+        "lint message not declared in RULE_MESSAGES: {msg:?}"
+    );
+    errors.push(FileError::new(path, msg));
+}
+
 /// Check lint rules on a parsed Frontmatter.  Returns errors (if any)
 /// without modifying anything.  Used by both `lint_md_file` and the
 /// sync protocol.
+///
+/// Any change to these rules or their message text requires bumping
+/// `SCHEMA_VERSION` in `db.rs`.  Messages are persisted per-doc in the cache
+/// and deduped against the current pass by exact text: without a bump, an
+/// added rule stays silent for every doc not re-upserted since, and reworded
+/// ones double-report.  New messages belong in `RULE_MESSAGES`.
+///
+/// Exemption: a *frozen series* — a terminal item carrying a recurrence with a
+/// non-empty completion log — keeps its `check_in_date`, `due_date` and
+/// recurrence block frozen at the final occurrence, so the two
+/// terminal-scheduling rules do not apply to it.  Terminal items with a
+/// recurrence but no completion history, and terminal items with leftover
+/// `check_in_date` and no recurrence, are still flagged.
 pub fn check_rules(path: &Path, fm: &Frontmatter) -> Vec<FileError> {
     let mut errors = Vec::new();
 
+    // A completed series freezes recurrence / check_in_date / due_date at the
+    // final occurrence.  That shape is a valid record, not leftover scheduling
+    // state.  Both conjuncts matter: non-recurring completions also append to
+    // the log, and a recurrence with an empty log was never completed here.
+    let frozen_series = fm.effective_rrule().is_some() && !fm.completion_log.is_empty();
+
     // Date mutual exclusivity rules (apply to all documents, not just tasks)
     if fm.on_date.is_some() && fm.start_date.is_some() {
-        errors.push(FileError::new(
-            path,
-            "on_date and start_date cannot both be set (use start_date + end_date for ranges)"
-                .to_string(),
-        ));
+        emit(&mut errors, path, MSG_ON_AND_START);
     }
     if fm.on_date.is_some() && fm.end_date.is_some() {
-        errors.push(FileError::new(
-            path,
-            "on_date and end_date cannot both be set (use start_date + end_date for ranges)"
-                .to_string(),
-        ));
+        emit(&mut errors, path, MSG_ON_AND_END);
     }
     if fm.end_date.is_some() && fm.start_date.is_none() {
-        errors.push(FileError::new(
-            path,
-            "end_date requires start_date".to_string(),
-        ));
+        emit(&mut errors, path, MSG_END_NEEDS_START);
     }
 
     if matches!(fm.status, Some(Status::Done | Status::Cancelled)) {
         if fm.on_date.is_none() && fm.end_date.is_none() {
-            errors.push(FileError::new(
-                path,
-                "done/cancelled item missing on_date or end_date".to_string(),
-            ));
+            emit(&mut errors, path, MSG_TERMINAL_NO_DATE);
         }
-        if fm.check_in_date.is_some() {
-            errors.push(FileError::new(
-                path,
-                "done/cancelled item has check_in_date set".to_string(),
-            ));
+        if fm.check_in_date.is_some() && !frozen_series {
+            emit(&mut errors, path, MSG_TERMINAL_CHECK_IN);
         }
-        if fm.effective_rrule().is_some() {
-            errors.push(FileError::new(
-                path,
-                "done/cancelled item has rrule set (remove rrule to stop recurrence)".to_string(),
-            ));
+        if fm.effective_rrule().is_some() && !frozen_series {
+            emit(&mut errors, path, MSG_TERMINAL_RRULE);
         }
     }
 
@@ -102,10 +140,7 @@ pub fn check_rules(path: &Path, fm: &Frontmatter) -> Vec<FileError> {
     ) && fm.check_in_date.is_none()
         && fm.due_date.is_none()
     {
-        errors.push(FileError::new(
-            path,
-            "active task missing check_in_date or due_date".to_string(),
-        ));
+        emit(&mut errors, path, MSG_ACTIVE_NO_DATE);
     }
 
     errors
@@ -324,6 +359,192 @@ mod tests {
     use chrono::NaiveDate;
     use std::fs;
     use tempfile::TempDir;
+
+    fn bare_fm() -> Frontmatter {
+        Frontmatter {
+            tldr: "test".to_string(),
+            labels: vec![],
+            created: None,
+            updated: None,
+            summary: None,
+            on_date: None,
+            start_date: None,
+            end_date: None,
+            due_date: None,
+            check_in_date: None,
+            verified_date: None,
+            context_link: None,
+            links: vec![],
+            attachments: vec![],
+            status: None,
+            priority: None,
+            effort: None,
+            blocked_by: vec![],
+            rrule: None,
+            tentative_date: None,
+            sort_order: None,
+            assigned_to: None,
+            recurrence: None,
+            completion_log: vec![],
+        }
+    }
+
+    fn log_entry(day: u32) -> crate::frontmatter::CompletionLogEntry {
+        crate::frontmatter::CompletionLogEntry {
+            completed: NaiveDate::from_ymd_opt(2026, 4, day).unwrap(),
+            occurrence: Some(NaiveDate::from_ymd_opt(2026, 4, day).unwrap()),
+            comment: None,
+        }
+    }
+
+    /// The frozen-series shape written on anchored exhaustion is exempt from
+    /// the two terminal-scheduling rules.  The exemption is status-symmetric:
+    /// a hand-abandoned series with preserved history is the same valid
+    /// record, so `cancelled` is exempt on the same terms as `done`.
+    #[test]
+    fn test_frozen_series_exempt_from_terminal_rules() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        for status in [Status::Done, Status::Cancelled] {
+            let label = status.to_string();
+            let fm = Frontmatter {
+                status: Some(status),
+                check_in_date: Some(d(2026, 4, 10)),
+                due_date: Some(d(2026, 4, 10)),
+                on_date: Some(d(2026, 4, 10)),
+                rrule: Some("FREQ=WEEKLY;COUNT=2".to_string()),
+                completion_log: vec![log_entry(10)],
+                ..bare_fm()
+            };
+            let errors = check_rules(Path::new("test.md"), &fm);
+            assert!(
+                errors.is_empty(),
+                "frozen series ({label}) must be clean; got: {:?}",
+                errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A completion log without any recurrence exempts nothing: non-recurring
+    /// completions append log entries too, so leftover `check_in_date` on a
+    /// plain done item is still a violation.
+    #[test]
+    fn test_completion_log_alone_does_not_exempt() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let fm = Frontmatter {
+            status: Some(Status::Done),
+            check_in_date: Some(d(2026, 4, 10)),
+            on_date: Some(d(2026, 4, 10)),
+            completion_log: vec![log_entry(10)],
+            ..bare_fm()
+        };
+        let messages: Vec<String> = check_rules(Path::new("test.md"), &fm)
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(messages, vec![MSG_TERMINAL_CHECK_IN]);
+    }
+
+    /// A recurrence with an empty completion log is a series never completed
+    /// through graf: both terminal rules still fire.
+    #[test]
+    fn test_empty_completion_log_still_flags_terminal_rules() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let fm = Frontmatter {
+            status: Some(Status::Done),
+            check_in_date: Some(d(2026, 4, 10)),
+            on_date: Some(d(2026, 4, 10)),
+            rrule: Some("FREQ=WEEKLY".to_string()),
+            ..bare_fm()
+        };
+        let messages: Vec<String> = check_rules(Path::new("test.md"), &fm)
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(messages, vec![MSG_TERMINAL_CHECK_IN, MSG_TERMINAL_RRULE,]);
+    }
+
+    /// A frozen series with no completion date still trips the date rule:
+    /// graf's own exhaustion always writes `on_date`.
+    #[test]
+    fn test_frozen_series_still_needs_completion_date() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let fm = Frontmatter {
+            status: Some(Status::Done),
+            check_in_date: Some(d(2026, 4, 10)),
+            rrule: Some("FREQ=WEEKLY".to_string()),
+            completion_log: vec![log_entry(10)],
+            ..bare_fm()
+        };
+        let messages: Vec<String> = check_rules(Path::new("test.md"), &fm)
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(messages, vec![MSG_TERMINAL_NO_DATE]);
+    }
+
+    /// Canary: asserts the fixtures below collectively emit exactly the
+    /// messages declared in `RULE_MESSAGES`, and pins the schema version
+    /// those messages are persisted under.  Lint messages live in
+    /// `docs.lint_errors` and are deduped against the current pass by exact
+    /// text, so stale persisted sets must be rebuilt whenever the rules
+    /// change.  Comparing against the declaration rather than a hand-copied
+    /// list means a rule added to `RULE_MESSAGES` but tripped by no fixture
+    /// also fails here, instead of passing unnoticed.
+    #[test]
+    fn test_check_rules_message_snapshot() {
+        let path = Path::new("test.md");
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+
+        let mut fixtures = Vec::new();
+
+        // Date mutual-exclusivity rules.
+        fixtures.push(Frontmatter {
+            on_date: Some(d(2026, 4, 10)),
+            start_date: Some(d(2026, 4, 1)),
+            end_date: Some(d(2026, 4, 15)),
+            ..bare_fm()
+        });
+        fixtures.push(Frontmatter {
+            end_date: Some(d(2026, 4, 15)),
+            ..bare_fm()
+        });
+
+        // Terminal-item rules.
+        fixtures.push(Frontmatter {
+            status: Some(Status::Done),
+            check_in_date: Some(d(2026, 4, 10)),
+            rrule: Some("FREQ=WEEKLY".to_string()),
+            ..bare_fm()
+        });
+
+        // Active-task rule.
+        fixtures.push(Frontmatter {
+            status: Some(Status::Todo),
+            ..bare_fm()
+        });
+
+        let mut messages: Vec<String> = fixtures
+            .iter()
+            .flat_map(|fm| check_rules(path, fm))
+            .map(|e| e.message)
+            .collect();
+        messages.sort();
+        messages.dedup();
+
+        let mut expected: Vec<String> = RULE_MESSAGES.iter().map(|m| m.to_string()).collect();
+        expected.sort();
+
+        assert_eq!(
+            messages, expected,
+            "check_rules output no longer matches RULE_MESSAGES — bump SCHEMA_VERSION in db.rs, \
+             and add a fixture here for any newly declared message"
+        );
+        assert_eq!(
+            crate::db::SCHEMA_VERSION,
+            "7",
+            "SCHEMA_VERSION changed — update this canary alongside it"
+        );
+    }
 
     #[test]
     fn test_format_timestamp() {
@@ -1033,30 +1254,9 @@ mod tests {
     fn test_on_date_and_start_date_invalid() {
         let path = Path::new("test.md");
         let fm = Frontmatter {
-            tldr: "test".to_string(),
-            labels: vec![],
-            created: None,
-            updated: None,
-            summary: None,
             on_date: Some(NaiveDate::from_ymd_opt(2026, 4, 10).unwrap()),
             start_date: Some(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()),
-            end_date: None,
-            due_date: None,
-            check_in_date: None,
-            verified_date: None,
-            context_link: None,
-            links: vec![],
-            attachments: vec![],
-            status: None,
-            priority: None,
-            effort: None,
-            blocked_by: vec![],
-            rrule: None,
-            tentative_date: None,
-            sort_order: None,
-            assigned_to: None,
-            recurrence: None,
-            completion_log: vec![],
+            ..bare_fm()
         };
         let errors = check_rules(path, &fm);
         assert!(errors.iter().any(|e| {
@@ -1069,30 +1269,9 @@ mod tests {
     fn test_on_date_and_end_date_invalid() {
         let path = Path::new("test.md");
         let fm = Frontmatter {
-            tldr: "test".to_string(),
-            labels: vec![],
-            created: None,
-            updated: None,
-            summary: None,
             on_date: Some(NaiveDate::from_ymd_opt(2026, 4, 10).unwrap()),
-            start_date: None,
             end_date: Some(NaiveDate::from_ymd_opt(2026, 4, 15).unwrap()),
-            due_date: None,
-            check_in_date: None,
-            verified_date: None,
-            context_link: None,
-            links: vec![],
-            attachments: vec![],
-            status: None,
-            priority: None,
-            effort: None,
-            blocked_by: vec![],
-            rrule: None,
-            tentative_date: None,
-            sort_order: None,
-            assigned_to: None,
-            recurrence: None,
-            completion_log: vec![],
+            ..bare_fm()
         };
         let errors = check_rules(path, &fm);
         assert!(errors.iter().any(|e| {
@@ -1105,30 +1284,8 @@ mod tests {
     fn test_end_date_without_start_date_invalid() {
         let path = Path::new("test.md");
         let fm = Frontmatter {
-            tldr: "test".to_string(),
-            labels: vec![],
-            created: None,
-            updated: None,
-            summary: None,
-            on_date: None,
-            start_date: None,
             end_date: Some(NaiveDate::from_ymd_opt(2026, 4, 15).unwrap()),
-            due_date: None,
-            check_in_date: None,
-            verified_date: None,
-            context_link: None,
-            links: vec![],
-            attachments: vec![],
-            status: None,
-            priority: None,
-            effort: None,
-            blocked_by: vec![],
-            rrule: None,
-            tentative_date: None,
-            sort_order: None,
-            assigned_to: None,
-            recurrence: None,
-            completion_log: vec![],
+            ..bare_fm()
         };
         let errors = check_rules(path, &fm);
         assert!(
@@ -1142,30 +1299,8 @@ mod tests {
     fn test_start_date_alone_valid() {
         let path = Path::new("test.md");
         let fm = Frontmatter {
-            tldr: "test".to_string(),
-            labels: vec![],
-            created: None,
-            updated: None,
-            summary: None,
-            on_date: None,
             start_date: Some(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()),
-            end_date: None,
-            due_date: None,
-            check_in_date: None,
-            verified_date: None,
-            context_link: None,
-            links: vec![],
-            attachments: vec![],
-            status: None,
-            priority: None,
-            effort: None,
-            blocked_by: vec![],
-            rrule: None,
-            tentative_date: None,
-            sort_order: None,
-            assigned_to: None,
-            recurrence: None,
-            completion_log: vec![],
+            ..bare_fm()
         };
         let errors = check_rules(path, &fm);
         assert!(errors.is_empty());
@@ -1175,30 +1310,9 @@ mod tests {
     fn test_start_date_plus_end_date_valid() {
         let path = Path::new("test.md");
         let fm = Frontmatter {
-            tldr: "test".to_string(),
-            labels: vec![],
-            created: None,
-            updated: None,
-            summary: None,
-            on_date: None,
             start_date: Some(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()),
             end_date: Some(NaiveDate::from_ymd_opt(2026, 4, 10).unwrap()),
-            due_date: None,
-            check_in_date: None,
-            verified_date: None,
-            context_link: None,
-            links: vec![],
-            attachments: vec![],
-            status: None,
-            priority: None,
-            effort: None,
-            blocked_by: vec![],
-            rrule: None,
-            tentative_date: None,
-            sort_order: None,
-            assigned_to: None,
-            recurrence: None,
-            completion_log: vec![],
+            ..bare_fm()
         };
         let errors = check_rules(path, &fm);
         assert!(errors.is_empty());

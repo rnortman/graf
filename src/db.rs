@@ -16,18 +16,23 @@ use crate::lint;
 // Schema
 // ---------------------------------------------------------------------------
 
-const SCHEMA_VERSION: &str = "5";
+/// Bump on any schema change, and also on any change to `lint::check_rules`
+/// (rules or message text): lint messages are persisted in `docs.lint_errors`
+/// and deduped by exact text, so stale sets must be rebuilt.
+pub(crate) const SCHEMA_VERSION: &str = "7";
 
 /// The COALESCE expression for effective date.  Used in the schema index,
 /// SELECT, WHERE, and ORDER BY.  Must be textually identical everywhere
 /// for SQLite's expression index to match.
 ///
 /// For active items the scheduling dates resolve first (lint requires at
-/// least one of check_in_date / due_date).  For terminal items those are
-/// stripped and on_date/end_date is the fallback.
-/// `on_date`/`end_date` must precede `due_date` so that terminal items
-/// (whose scheduling dates are stripped) sort by completion date, not
-/// their old deadline.
+/// least one of check_in_date / due_date).  Terminal items normally have
+/// their scheduling dates stripped, so on_date/end_date is the fallback;
+/// `on_date`/`end_date` precede `due_date` so those items sort by
+/// completion date, not their old deadline.  A frozen series (terminal,
+/// recurrence retained) is the exception: it keeps `check_in_date` frozen
+/// at the final occurrence, which therefore wins the COALESCE over its
+/// `on_date`.  TODO(frozen-series-effective-date)
 const EFF_DATE: &str = "COALESCE(tentative_date, check_in_date, on_date, end_date, due_date)";
 
 const SCHEMA_DDL: &str = "
@@ -53,6 +58,7 @@ CREATE TABLE IF NOT EXISTS docs (
     context_link    TEXT,
     rrule           TEXT,
     blocked_by      TEXT,
+    lint_errors     TEXT NOT NULL DEFAULT '[]',
     dirty           INTEGER NOT NULL DEFAULT 0
 );
 
@@ -163,16 +169,21 @@ pub fn db_path(repo_dir: &Path) -> PathBuf {
 /// handle ready for queries.
 pub fn open_and_sync(repo_dir: &Path) -> Result<SyncResult> {
     let mut cache = open_db(repo_dir)?;
-    let is_new = cache
-        .conn
-        .query_row(
-            "SELECT 1 FROM meta WHERE key = 'last_indexed_commit'",
-            [],
-            |_| Ok(()),
-        )
-        .is_err();
+    // A never-synced DB has the `meta` table (open_db just created it) but no
+    // `last_indexed_commit` row.  Any other read failure is a real fault:
+    // reindexing on it would drop both tables, destroying the evidence and
+    // reporting the wrong cause.
+    let is_new = match cache.conn.query_row(
+        "SELECT 1 FROM meta WHERE key = 'last_indexed_commit'",
+        [],
+        |_| Ok(()),
+    ) {
+        Ok(()) => false,
+        Err(rusqlite::Error::QueryReturnedNoRows) => true,
+        Err(e) => return Err(e).context("failed to read last_indexed_commit from cache DB"),
+    };
 
-    if is_new || schema_version_mismatch(&cache.conn) {
+    if is_new || schema_version_mismatch(&cache.conn)? {
         let errors = do_reindex(&mut cache)?;
         return Ok(SyncResult { cache, errors });
     }
@@ -200,7 +211,7 @@ pub fn open_cache_no_sync(repo_dir: &Path) -> Result<Cache> {
         );
     }
     let cache = open_db(repo_dir)?;
-    if schema_version_mismatch(&cache.conn) {
+    if schema_version_mismatch(&cache.conn)? {
         bail!(
             "cache DB at {} has stale schema — query this repo to rebuild it",
             path.display()
@@ -343,6 +354,26 @@ impl Cache {
         Ok(tasks)
     }
 
+    /// All persisted lint errors for every cached doc, repo-wide and
+    /// independent of any task filter.  A separate scan rather than a
+    /// `TaskRow` field: `query_tasks` filters by status and horizon, so
+    /// reading lint state off returned rows alone would keep terminal-item
+    /// and horizon-excluded violations invisible.
+    pub fn all_lint_errors(&self) -> Result<Vec<FileError>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, lint_errors FROM docs WHERE lint_errors != '[]' ORDER BY path",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut errors = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path = PathBuf::from(row.get::<_, String>(0)?);
+            for message in parse_json_vec(row.get::<_, Option<String>>(1)?)? {
+                errors.push(FileError::new(&path, message));
+            }
+        }
+        Ok(errors)
+    }
+
     /// Look up a single document by path.  Returns None if not in the cache.
     pub fn get_doc(&self, rel_path: &Path) -> Result<Option<TaskRow>> {
         let path_str = rel_path.to_str().context("path is not UTF-8")?;
@@ -447,20 +478,26 @@ impl QueryBuilder {
 // Internal: schema version check
 // ---------------------------------------------------------------------------
 
-/// Returns true if the DB has a schema version that doesn't match the current one.
-fn schema_version_mismatch(conn: &rusqlite::Connection) -> bool {
-    let version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
+/// Returns true if the DB has a schema version that doesn't match the current
+/// one.  A missing row counts as a mismatch: pre-versioning caches predate the
+/// current column set and must be rebuilt rather than queried.  Genuinely new
+/// DBs are caught by the `is_new` check before this runs.
+///
+/// Any other SQLite failure (corruption, I/O) propagates rather than being
+/// read as staleness — a reindex would destroy the evidence and report the
+/// wrong cause.
+fn schema_version_mismatch(conn: &rusqlite::Connection) -> Result<bool> {
+    let version: Option<String> = match conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e).context("failed to read schema_version from cache DB"),
+    };
 
-    match version.as_deref() {
-        None | Some(SCHEMA_VERSION) => false,
-        Some(_) => true,
-    }
+    Ok(version.as_deref() != Some(SCHEMA_VERSION))
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +676,7 @@ fn reconcile_dirty(
                 errors.append(&mut file_errors);
             }
             Err(e) => {
+                // TODO(persist-parse-errors)
                 tx.execute("DELETE FROM docs WHERE path = ?1", params![path_str])?;
                 errors.push(FileError::new(&path, format!("{e:#}")));
             }
@@ -676,6 +714,7 @@ fn apply_changed_files(
                         errors.append(&mut file_errors);
                     }
                     Err(e) => {
+                        // TODO(persist-parse-errors)
                         let path_str = cf.path.to_str().context("path is not UTF-8")?;
                         tx.execute("DELETE FROM docs WHERE path = ?1", params![path_str])?;
                         errors.push(FileError::new(&cf.path, format!("{e:#}")));
@@ -743,21 +782,32 @@ fn parse_validate_and_migrate(
 /// Upsert a doc's frontmatter into the cache.  Works on both `Connection`
 /// and `Transaction` (which derefs to `Connection`).  Only caches the subset
 /// of frontmatter fields relevant to scheduling, filtering, and sorting.
+///
+/// Lint state is computed here rather than passed in, so that stored lint
+/// messages always match the stored frontmatter no matter which call site
+/// wrote the row — the mutation paths in `todo.rs` have no lint plumbing of
+/// their own and would otherwise clear the state.  The sync call sites run
+/// `check_rules` a second time as a result; it is a pure in-memory check over
+/// a handful of `Option`s.
 fn execute_upsert(
     conn: &rusqlite::Connection,
     rel_path: &Path,
     fm: &Frontmatter,
     dirty: bool,
 ) -> Result<()> {
+    let lint_messages: Vec<String> = lint::check_rules(rel_path, fm)
+        .into_iter()
+        .map(|e| e.message)
+        .collect();
     conn.execute(
         "INSERT INTO docs (
             path, tldr, status, priority, effort,
             tentative_date, check_in_date, due_date, on_date, end_date,
             sort_order, labels, assigned_to, context_link, rrule,
-            blocked_by, dirty
+            blocked_by, lint_errors, dirty
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17
+            ?16, ?17, ?18
         ) ON CONFLICT(path) DO UPDATE SET
             tldr=excluded.tldr, status=excluded.status,
             priority=excluded.priority, effort=excluded.effort,
@@ -770,6 +820,7 @@ fn execute_upsert(
             assigned_to=excluded.assigned_to,
             context_link=excluded.context_link,
             rrule=excluded.rrule, blocked_by=excluded.blocked_by,
+            lint_errors=excluded.lint_errors,
             dirty=excluded.dirty",
         params![
             rel_path.to_str().context("path is not UTF-8")?,
@@ -788,6 +839,7 @@ fn execute_upsert(
             fm.context_link.as_deref(),
             fm.effective_rrule(),
             serde_json::to_string(&fm.blocked_by)?,
+            serde_json::to_string(&lint_messages)?,
             dirty,
         ],
     )?;
@@ -1966,5 +2018,300 @@ Body.
         assert!(after.contains("recurrence:"));
         assert!(!after.contains("\nrrule:"));
         assert!(!after.contains("completion_log:"));
+    }
+
+    // -- Persisted lint state --
+
+    /// Raw `lint_errors` column for a path, as stored.
+    fn lint_errors_col(cache: &Cache, path: &str) -> String {
+        cache
+            .conn
+            .query_row(
+                "SELECT lint_errors FROM docs WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn parse_fm(yaml: &str) -> Frontmatter {
+        frontmatter::parse_frontmatter(&format!("---\n{yaml}\n---\n"))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_lint_errors_persist_across_quiescent_sync() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "bad.md",
+            "tldr: Bad\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+
+        // First sync: reindex lints the file and reports it.
+        let first = open_and_sync(dir.path()).unwrap();
+        assert!(
+            first
+                .errors
+                .iter()
+                .any(|e| e.message.contains("check_in_date"))
+        );
+        drop(first);
+
+        // Second sync: HEAD unchanged, clean tree — sync re-lints nothing,
+        // but the persisted state still carries the violation.
+        let second = open_and_sync(dir.path()).unwrap();
+        assert!(
+            second.errors.is_empty(),
+            "quiescent sync should re-lint nothing: {:?}",
+            second.errors
+        );
+        let persisted = second.cache.all_lint_errors().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].path, PathBuf::from("bad.md"));
+        assert!(persisted[0].message.contains("check_in_date"));
+    }
+
+    #[test]
+    fn test_lint_errors_cleared_when_file_fixed() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "bad.md",
+            "tldr: Bad\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+        drop(open_and_sync(dir.path()).unwrap());
+
+        // Drop the offending field and commit the fix.
+        write_md(
+            dir.path(),
+            "bad.md",
+            "tldr: Bad\nstatus: done\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+
+        let result = open_and_sync(dir.path()).unwrap();
+        assert!(result.errors.is_empty());
+        assert!(result.cache.all_lint_errors().unwrap().is_empty());
+        assert_eq!(lint_errors_col(&result.cache, "bad.md"), "[]");
+    }
+
+    #[test]
+    fn test_upsert_doc_refreshes_lint_state() {
+        let dir = create_test_repo();
+        write_md(dir.path(), "seed.md", "tldr: Seed");
+        commit_all(dir.path());
+        let cache = open_and_sync(dir.path()).unwrap().cache;
+
+        let path = Path::new("task.md");
+        let bad =
+            parse_fm("tldr: Task\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10");
+        cache.upsert_doc(path, &bad, false).unwrap();
+        let errors = cache.all_lint_errors().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("check_in_date"));
+
+        // Upserting a clean version over it clears the stored state.
+        let good = parse_fm("tldr: Task\nstatus: done\non_date: 2026-04-10");
+        cache.upsert_doc(path, &good, false).unwrap();
+        assert!(cache.all_lint_errors().unwrap().is_empty());
+        assert_eq!(lint_errors_col(&cache, "task.md"), "[]");
+    }
+
+    #[test]
+    fn test_all_lint_errors_fails_on_corrupt_json() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "bad.md",
+            "tldr: Bad\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+        let cache = open_and_sync(dir.path()).unwrap().cache;
+
+        cache
+            .conn
+            .execute(
+                "UPDATE docs SET lint_errors = '{not json' WHERE path = 'bad.md'",
+                [],
+            )
+            .unwrap();
+
+        let err = cache.all_lint_errors().unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("corrupt JSON array in cache DB"),
+            "expected fail-fast on corrupt lint_errors, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn test_schema_version_query_error_propagates() {
+        let dir = create_test_repo();
+        write_md(dir.path(), "a.md", "tldr: A");
+        commit_all(dir.path());
+        let cache = open_and_sync(dir.path()).unwrap().cache;
+
+        // A BLOB survives the column's TEXT affinity, so reading it as a
+        // String fails — a stand-in for a corrupt/unreadable meta table.
+        cache
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', x'00ff')",
+                [],
+            )
+            .unwrap();
+
+        let err = schema_version_mismatch(&cache.conn).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to read schema_version"),
+            "expected the DB error to propagate, got: {err:#}"
+        );
+    }
+
+    /// A failed `last_indexed_commit` probe must not read as "fresh DB": the
+    /// resulting reindex would drop both tables and hide the real fault.
+    #[test]
+    fn test_last_indexed_commit_query_error_propagates() {
+        let dir = create_test_repo();
+        write_md(dir.path(), "a.md", "tldr: A");
+        commit_all(dir.path());
+        {
+            let cache = open_and_sync(dir.path()).unwrap().cache;
+            // Replace `meta` with a table of the same name but the wrong
+            // shape: `CREATE TABLE IF NOT EXISTS` leaves it alone and the
+            // probe fails with "no such column: key" — a fault, not a
+            // never-synced DB.
+            cache
+                .conn
+                .execute_batch(
+                    "DROP TABLE meta; CREATE TABLE meta (wrong_column TEXT PRIMARY KEY);",
+                )
+                .unwrap();
+        }
+
+        let Err(err) = open_and_sync(dir.path()) else {
+            panic!("expected the probe failure to propagate, got a successful sync");
+        };
+        assert!(
+            format!("{err:#}").contains("failed to read last_indexed_commit"),
+            "expected the DB error to propagate, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_all_lint_errors_expands_multiple_messages() {
+        let dir = create_test_repo();
+        write_md(dir.path(), "seed.md", "tldr: Seed");
+        commit_all(dir.path());
+        let cache = open_and_sync(dir.path()).unwrap().cache;
+
+        // Trips both the terminal-check_in_date rule and the terminal-rrule rule.
+        let fm = parse_fm(
+            "tldr: Task\nstatus: done\non_date: 2026-04-10\ncheck_in_date: 2026-05-01\nrecurrence:\n  rrule: \"FREQ=WEEKLY\"",
+        );
+        cache.upsert_doc(Path::new("task.md"), &fm, false).unwrap();
+
+        let errors = cache.all_lint_errors().unwrap();
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        assert!(errors.iter().all(|e| e.path == PathBuf::from("task.md")));
+        assert!(errors.iter().any(|e| e.message.contains("check_in_date")));
+        assert!(errors.iter().any(|e| e.message.contains("rrule")));
+    }
+
+    #[test]
+    fn test_unparseable_file_drops_persisted_lint_state() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "task.md",
+            "tldr: Bad\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+
+        let first = open_and_sync(dir.path()).unwrap();
+        assert_eq!(first.cache.all_lint_errors().unwrap().len(), 1);
+        drop(first);
+
+        // Break the file (uncommitted): the row goes, and its lint state with it.
+        fs::write(dir.path().join("task.md"), "---\nbogus_field: oops\n---\n").unwrap();
+
+        let second = open_and_sync(dir.path()).unwrap();
+        assert_eq!(count_docs(&second.cache), 0);
+        assert!(second.cache.all_lint_errors().unwrap().is_empty());
+        // The parse failure itself is still reported for this pass.
+        assert_eq!(second.errors.len(), 1);
+        assert!(second.errors[0].path.to_str().unwrap().contains("task.md"));
+    }
+
+    #[test]
+    fn test_stale_schema_version_reindex_populates_lint_state() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "bad.md",
+            "tldr: Bad\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+        drop(open_and_sync(dir.path()).unwrap());
+
+        let conn = rusqlite::Connection::open(db_path(dir.path())).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = open_and_sync(dir.path()).unwrap();
+        assert_eq!(count_docs(&result.cache), 1);
+        let errors = result.cache.all_lint_errors().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("check_in_date"));
+    }
+
+    #[test]
+    fn test_missing_schema_version_row_triggers_reindex() {
+        let dir = create_test_repo();
+        write_md(
+            dir.path(),
+            "bad.md",
+            "tldr: Bad\nstatus: done\ncheck_in_date: 2026-05-01\non_date: 2026-04-10",
+        );
+        commit_all(dir.path());
+        drop(open_and_sync(dir.path()).unwrap());
+
+        // A pre-versioning cache: has last_indexed_commit but no schema_version.
+        let conn = rusqlite::Connection::open(db_path(dir.path())).unwrap();
+        conn.execute("DELETE FROM meta WHERE key = 'schema_version'", [])
+            .unwrap();
+        drop(conn);
+
+        let result = open_and_sync(dir.path()).unwrap();
+        assert_eq!(count_docs(&result.cache), 1);
+        let errors = result.cache.all_lint_errors().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("check_in_date"));
+    }
+
+    #[test]
+    fn test_open_cache_no_sync_rejects_missing_schema_version() {
+        let dir = create_test_repo();
+        write_md(dir.path(), "task.md", "tldr: Task");
+        commit_all(dir.path());
+        drop(open_and_sync(dir.path()).unwrap());
+
+        let conn = rusqlite::Connection::open(db_path(dir.path())).unwrap();
+        conn.execute("DELETE FROM meta WHERE key = 'schema_version'", [])
+            .unwrap();
+        drop(conn);
+
+        let Err(err) = open_cache_no_sync(dir.path()) else {
+            panic!("expected open_cache_no_sync to reject a pre-versioning cache");
+        };
+        assert!(err.to_string().contains("stale schema"), "got: {err:#}");
     }
 }
