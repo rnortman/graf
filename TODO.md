@@ -28,10 +28,6 @@ The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and hor
 
 `Frontmatter.rrule: Option<String>` is retained as a legacy-shape compat field (`src/frontmatter.rs`). Reindex eagerly migrates old files into the nested `recurrence` block, and no write path emits flat `rrule`. Once we're confident no repos still carry legacy-shape files (or are willing to surface them as parse errors for manual fix-up), remove the field and the associated `Field::Rrule` variant, plus the legacy-compat branches in `maybe_migrate_legacy` and `effective_rrule`.
 
-## `migration-rrule-syntax-validation`
-
-`maybe_migrate_legacy` in `src/migrate.rs` rewrites legacy frontmatter without validating that the `rrule` string is parseable. A file with a broken `rrule` (e.g. `FREQ=BOGUS`) migrates into the nested shape still broken; runtime breakage surfaces only when `compute_next_occurrence` is invoked. The intended behavior is that a `FREQ=BOGUS` rrule records a `FileError` and leaves the file untouched, but neither lint nor parse validates rrule syntax elsewhere, so migration isn't the natural place to add enforcement. Consider adding an rrule-syntax lint rule that applies uniformly; migration would then surface the issue via the post-rewrite lint pass.
-
 ## `persist-parse-errors`
 
 Lint-rule violations are persisted per-doc in `docs.lint_errors`, so `graf todo` reports them on every query. Parse and validation failures are not: a file that fails to parse has its cache row deleted (`reconcile_dirty` and `apply_changed_files` in `src/db.rs`), so its error is reported only on the sync pass that touched it — the same ephemerality that persisted lint state fixed for lint rules.

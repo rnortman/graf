@@ -1620,14 +1620,26 @@ pub fn todo_reorder(opts: &ReorderOptions) -> Result<ReorderResult> {
 // Recurrence helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the next occurrence date from an RFC 5545 RRULE string.
+/// Parse an RFC 5545 RRULE body into an `RRuleSet` anchored at noon-UTC on
+/// `dtstart_date`.
 ///
-/// Uses `dtstart_date` as the DTSTART (the current occurrence's scheduled date)
-/// and returns the first occurrence strictly after DTSTART, or None if the rule
-/// is exhausted.
-fn compute_next_occurrence(rrule_str: &str, dtstart_date: NaiveDate) -> Result<Option<NaiveDate>> {
+/// The rrule crate cannot parse a bare RRULE body, so this synthesizes the
+/// `DTSTART:` line the parser requires. Noon-UTC is deliberate: it sidesteps
+/// DST seams in the crate. The crate validates at parse time and validation
+/// is DTSTART-relative — notably a rule whose `UNTIL` precedes `dtstart_date`
+/// is rejected outright.
+pub(crate) fn parse_rrule_set(rrule_str: &str, dtstart_date: NaiveDate) -> Result<RRuleSet> {
+    // An embedded newline lets the body inject additional ICS content lines
+    // (a second RRULE, or EXRULE/RDATE/EXDATE) into the DTSTART block built
+    // below.  The rrule crate accepts multi-line input, so such a line would
+    // silently change occurrence computation while parsing cleanly.  Reject it
+    // so both lint and the done-time callers refuse the injection.
+    ensure!(
+        !rrule_str.contains(['\n', '\r']),
+        "rrule contains an embedded newline"
+    );
+
     // The rrule crate needs DateTime<Tz>, not NaiveDate.
-    // noon-UTC is deliberate: sidesteps DST seams in the rrule crate.
     let noon = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
     let dtstart = Utc
         .from_utc_datetime(&dtstart_date.and_time(noon))
@@ -1637,9 +1649,18 @@ fn compute_next_occurrence(rrule_str: &str, dtstart_date: NaiveDate) -> Result<O
         "DTSTART:{}\nRRULE:{rrule_str}",
         dtstart.format("%Y%m%dT%H%M%SZ")
     );
-    let rrset: RRuleSet = full_str
+    full_str
         .parse()
-        .with_context(|| format!("parsing rrule: {rrule_str}"))?;
+        .with_context(|| format!("parsing rrule: {rrule_str}"))
+}
+
+/// Compute the next occurrence date from an RFC 5545 RRULE string.
+///
+/// Uses `dtstart_date` as the DTSTART (the current occurrence's scheduled date)
+/// and returns the first occurrence strictly after DTSTART, or None if the rule
+/// is exhausted.
+fn compute_next_occurrence(rrule_str: &str, dtstart_date: NaiveDate) -> Result<Option<NaiveDate>> {
+    let rrset = parse_rrule_set(rrule_str, dtstart_date)?;
 
     // The rrule crate includes dtstart itself as the first occurrence,
     // so we need at most 2 to find the one strictly after dtstart.
@@ -1675,17 +1696,7 @@ fn compute_occurrence_after(
     dtstart_date: NaiveDate,
     threshold: NaiveDate,
 ) -> Result<Option<NaiveDate>> {
-    let noon = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
-    let dtstart = Utc
-        .from_utc_datetime(&dtstart_date.and_time(noon))
-        .with_timezone(&rrule::Tz::UTC);
-    let full_str = format!(
-        "DTSTART:{}\nRRULE:{rrule_str}",
-        dtstart.format("%Y%m%dT%H%M%SZ")
-    );
-    let rrset: RRuleSet = full_str
-        .parse()
-        .with_context(|| format!("parsing rrule: {rrule_str}"))?;
+    let rrset = parse_rrule_set(rrule_str, dtstart_date)?;
 
     // Safety bound: stale-anchor windows realistically produce tens to low
     // hundreds; MAX_RRULE_ITERATIONS protects against pathological rrule
@@ -2278,6 +2289,70 @@ mod tests {
         assert!(
             !content.contains("recurrence:"),
             "recurrence not stripped:\n{content}"
+        );
+    }
+
+    #[test]
+    fn parse_rrule_set_accepts_a_valid_rule() {
+        assert!(parse_rrule_set("FREQ=WEEKLY;BYDAY=SA", d(2026, 4, 18)).is_ok());
+    }
+
+    #[test]
+    fn parse_rrule_set_error_names_the_rule() {
+        let err = parse_rrule_set("FREQ=BOGUS", d(2026, 4, 18)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("FREQ=BOGUS"),
+            "error should name the offending rule: {err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_rrule_set_rejects_embedded_newline() {
+        // A newline would inject additional ICS content lines into the parse.
+        for injected in [
+            "FREQ=DAILY\nRRULE:FREQ=MINUTELY",
+            "FREQ=DAILY\rRRULE:FREQ=MINUTELY",
+        ] {
+            let err = parse_rrule_set(injected, d(2026, 4, 18)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("newline"),
+                "expected newline rejection, got: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn todo_cancel_refuses_a_task_with_an_unparseable_rrule() {
+        // The lint-gate in `read_and_validate` blocks every mutation of a
+        // broken-rrule task, cancel included — even though cancel would strip
+        // the recurrence and so incidentally remove the bad rrule.  Mutating
+        // around corrupt data hides it; the remedy is to fix the rrule in the
+        // file first.
+        let dir = setup_repo();
+        let source = "---\ntldr: test\nstatus: todo\ncheck_in_date: 2026-04-18\nrecurrence:\n  rrule: \"FREQ=BOGUS\"\n---\nBody.\n";
+        let path = write_task(&dir, "todo/task.md", source);
+
+        let outcome = todo_cancel(&CancelOptions {
+            repo_dir: dir.path().to_path_buf(),
+            path: path.clone(),
+            date: None,
+            replacing: None,
+            today: Some(d(2026, 4, 18)),
+        });
+        let Err(err) = outcome else {
+            panic!("cancel must be blocked by the lint gate");
+        };
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("has lint errors, fix before mutating"),
+            "{msg}"
+        );
+        assert!(msg.contains("FREQ=BOGUS"), "{msg}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&path)).unwrap(),
+            source,
+            "file must be left untouched"
         );
     }
 

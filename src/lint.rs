@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -56,12 +56,17 @@ const MSG_TERMINAL_RRULE: &str =
     "done/cancelled item has rrule set (remove rrule to stop recurrence)";
 const MSG_ACTIVE_NO_DATE: &str = "active task missing check_in_date or due_date";
 
-/// Roster of every message `check_rules` can emit.  The rules reference the
-/// `MSG_*` constants directly and emit through `emit`, which asserts
-/// membership here, so an unregistered message fails in every debug/test run
-/// regardless of fixture coverage.  The message-snapshot test checks its
-/// fixtures against this array in the other direction: a message listed here
-/// that no fixture trips fails the test rather than passing unnoticed.
+/// Roster of every *fixed-text* message `check_rules` can emit.  Those rules
+/// reference the `MSG_*` constants directly and emit through `emit`, which
+/// asserts membership here, so an unregistered message fails in every
+/// debug/test run regardless of fixture coverage.  The message-snapshot test
+/// checks its fixtures against this array in the other direction: a message
+/// listed here that no fixture trips fails the test rather than passing
+/// unnoticed.
+///
+/// The unparseable-rrule rule is deliberately outside this scheme: its text
+/// embeds the offending rrule string and the parser's error, so it has no
+/// fixed form to register or dedupe fixtures against.
 const RULE_MESSAGES: [&str; 7] = [
     MSG_ON_AND_START,
     MSG_ON_AND_END,
@@ -71,6 +76,16 @@ const RULE_MESSAGES: [&str; 7] = [
     MSG_TERMINAL_RRULE,
     MSG_ACTIVE_NO_DATE,
 ];
+
+/// DTSTART the rrule-syntax rule parses against.  The rrule crate validates
+/// at parse time and that validation is DTSTART-relative: a rule whose `UNTIL`
+/// precedes DTSTART is rejected as `UntilBeforeStart`.  Lint has no real
+/// anchor date, so it anchors at the epoch — otherwise a perfectly valid rule
+/// with an `UNTIL` in the past would lint as broken.  Pre-1970 `UNTIL` values
+/// are not plausible in this system.
+fn lint_rrule_dtstart() -> NaiveDate {
+    NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date is valid")
+}
 
 /// Single emit point for lint violations.  Every message must be declared in
 /// `RULE_MESSAGES`; the assertion makes an undeclared one fail loudly in
@@ -92,7 +107,10 @@ fn emit(errors: &mut Vec<FileError>, path: &Path, msg: &'static str) {
 /// `SCHEMA_VERSION` in `db.rs`.  Messages are persisted per-doc in the cache
 /// and deduped against the current pass by exact text: without a bump, an
 /// added rule stays silent for every doc not re-upserted since, and reworded
-/// ones double-report.  New messages belong in `RULE_MESSAGES`.
+/// ones double-report.  New messages belong in `RULE_MESSAGES`.  The
+/// unparseable-rrule rule embeds the `rrule` crate's error text, so a
+/// `rrule`-crate upgrade that rewords that error is also a message-text change
+/// and requires the same bump.
 ///
 /// Exemption: a *frozen series* — a terminal item carrying a recurrence with a
 /// non-empty completion log — keeps its `check_in_date`, `due_date` and
@@ -141,6 +159,24 @@ pub fn check_rules(path: &Path, fm: &Frontmatter) -> Vec<FileError> {
         && fm.due_date.is_none()
     {
         emit(&mut errors, path, MSG_ACTIVE_NO_DATE);
+    }
+
+    // Recurrence rules must parse.  Checked for every document carrying an
+    // effective rrule regardless of status: an unparseable rule is corrupt
+    // data whether or not the item is still active, and a terminal item can
+    // legitimately collect both this error and MSG_TERMINAL_RRULE.  The
+    // message embeds the offending string, so it carries no `MSG_*` constant
+    // and does not go through `emit`.
+    if let Some(rrule) = fm.effective_rrule()
+        && let Err(e) = crate::todo::parse_rrule_set(rrule, lint_rrule_dtstart())
+    {
+        // `root_cause()` is the parser's own error; the intermediate
+        // `with_context("parsing rrule: …")` from `parse_rrule_set` repeats the
+        // rrule string this message already names, so skip the full chain.
+        errors.push(FileError::new(
+            path,
+            format!("unparseable rrule '{rrule}': {}", e.root_cause()),
+        ));
     }
 
     errors
@@ -541,7 +577,7 @@ mod tests {
         );
         assert_eq!(
             crate::db::SCHEMA_VERSION,
-            "7",
+            "8",
             "SCHEMA_VERSION changed — update this canary alongside it"
         );
     }
@@ -1316,6 +1352,119 @@ mod tests {
         };
         let errors = check_rules(path, &fm);
         assert!(errors.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Unparseable-rrule rule
+    // -----------------------------------------------------------------------
+
+    fn lint_content(content: &str) -> LintResult {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("test.md");
+        fs::write(&file, content).unwrap();
+        let mut result = LintResult::default();
+        lint_md_file(&file, None, false, &mut result).unwrap();
+        result
+    }
+
+    fn rrule_errors(result: &LintResult) -> Vec<&str> {
+        result
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .filter(|m| m.starts_with("unparseable rrule"))
+            .collect()
+    }
+
+    #[test]
+    fn test_broken_nested_rrule_is_error() {
+        let result = lint_content(
+            "---\ntldr: test\nstatus: todo\ncheck_in_date: '2026-05-01'\nrecurrence:\n  rrule: \"FREQ=BOGUS\"\n---\n",
+        );
+        assert_eq!(result.errors.len(), 1, "got: {:?}", result.errors);
+        assert!(result.errors[0].message.contains("FREQ=BOGUS"));
+    }
+
+    #[test]
+    fn test_broken_flat_rrule_is_error() {
+        // Uniformity: the rule reads `effective_rrule()`, so the legacy flat
+        // shape is checked on the same terms as the nested one.
+        let result = lint_content(
+            "---\ntldr: test\nstatus: todo\ncheck_in_date: '2026-05-01'\nrrule: \"FREQ=BOGUS\"\n---\n",
+        );
+        assert_eq!(result.errors.len(), 1, "got: {:?}", result.errors);
+        assert!(result.errors[0].message.contains("FREQ=BOGUS"));
+    }
+
+    #[test]
+    fn test_broken_rrule_on_statusless_doc_is_error() {
+        // Status-independent: a knowledge-base entry carrying a broken rrule
+        // is still corrupt data.
+        let result = lint_content("---\ntldr: test\nrrule: \"FREQ=BOGUS\"\n---\n");
+        assert_eq!(result.errors.len(), 1, "got: {:?}", result.errors);
+        assert!(result.errors[0].message.contains("FREQ=BOGUS"));
+    }
+
+    #[test]
+    fn test_valid_rrule_with_past_until_is_ok() {
+        // The rrule crate rejects UNTIL < DTSTART at parse time, so lint
+        // anchors at the epoch.  A valid rule whose UNTIL has already passed
+        // must not lint as broken.
+        let result = lint_content(
+            "---\ntldr: test\nstatus: todo\ncheck_in_date: '2026-05-01'\nrecurrence:\n  rrule: \"FREQ=DAILY;UNTIL=20200101T120000Z\"\n---\n",
+        );
+        assert!(result.errors.is_empty(), "got: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_empty_rrule_is_error() {
+        let result = lint_content(
+            "---\ntldr: test\nstatus: todo\ncheck_in_date: '2026-05-01'\nrrule: \"\"\n---\n",
+        );
+        assert_eq!(rrule_errors(&result).len(), 1, "got: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_done_with_broken_rrule_reports_both_errors() {
+        // Lint errors are additive: the terminal-rrule rule and the
+        // unparseable-rrule rule are independently true here.
+        let result = lint_content(
+            "---\ntldr: test\nstatus: done\non_date: '2026-04-10'\nrrule: \"FREQ=BOGUS\"\n---\n",
+        );
+        let messages: Vec<&str> = result.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| *m == MSG_TERMINAL_RRULE),
+            "got: {messages:?}"
+        );
+        assert_eq!(rrule_errors(&result).len(), 1, "got: {messages:?}");
+    }
+
+    #[test]
+    fn test_newline_injected_rrule_is_error() {
+        // A double-quoted YAML scalar carries a literal newline into the rrule
+        // string, which would otherwise inject a second ICS content line.  The
+        // rule must flag it rather than bless it as clean.
+        let result = lint_content(
+            "---\ntldr: test\nstatus: todo\ncheck_in_date: '2026-05-01'\nrrule: \"FREQ=DAILY\\nRRULE:FREQ=MINUTELY\"\n---\n",
+        );
+        assert_eq!(rrule_errors(&result).len(), 1, "got: {:?}", result.errors);
+        assert!(result.errors[0].message.contains("newline"));
+    }
+
+    #[test]
+    fn test_unparseable_rrule_message_is_stable() {
+        // Canary pinning the exact persisted message text for a fixed bad rule.
+        // The tail is the `rrule` crate's own parse-error wording, which is
+        // persisted verbatim in `docs.lint_errors`.  If this fails after an
+        // `rrule`-crate upgrade that reworded the error, bump SCHEMA_VERSION in
+        // db.rs and update this snapshot.
+        let result = lint_content("---\ntldr: test\nrrule: \"FREQ=BOGUS\"\n---\n");
+        let msgs = rrule_errors(&result);
+        assert_eq!(msgs.len(), 1, "got: {:?}", result.errors);
+        assert_eq!(
+            msgs[0],
+            "unparseable rrule 'FREQ=BOGUS': `BOGUS` is not a valid frequency.",
+        );
     }
 
     #[test]
