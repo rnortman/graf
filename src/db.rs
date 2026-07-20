@@ -18,8 +18,12 @@ use crate::lint;
 
 /// Bump on any schema change, and also on any change to `lint::check_rules`
 /// (rules or message text): lint messages are persisted in `docs.lint_errors`
-/// and deduped by exact text, so stale sets must be rebuilt.
-pub(crate) const SCHEMA_VERSION: &str = "7";
+/// and deduped by exact text, so stale sets must be rebuilt.  The
+/// unparseable-rrule rule embeds the `rrule` crate's own error text in its
+/// message, so a `rrule`-crate upgrade that rewords that error also changes
+/// persisted message text and requires a bump, even with `check_rules`
+/// untouched.
+pub(crate) const SCHEMA_VERSION: &str = "8";
 
 /// The COALESCE expression for effective date.  Used in the schema index,
 /// SELECT, WHERE, and ORDER BY.  Must be textually identical everywhere
@@ -813,8 +817,8 @@ fn parse_validate_and_migrate(
 /// messages always match the stored frontmatter no matter which call site
 /// wrote the row — the mutation paths in `todo.rs` have no lint plumbing of
 /// their own and would otherwise clear the state.  The sync call sites run
-/// `check_rules` a second time as a result; it is a pure in-memory check over
-/// a handful of `Option`s.
+/// `check_rules` a second time as a result; it is a pure in-memory check
+/// (field comparisons plus an rrule string parse for docs carrying one).
 fn execute_upsert(
     conn: &rusqlite::Connection,
     rel_path: &Path,
@@ -2182,6 +2186,48 @@ did it early
         // rrule column should carry the effective value so queries still work.
         let row = result.cache.get_doc(Path::new(file)).unwrap().expect("row");
         assert_eq!(row.rrule.as_deref(), Some("FREQ=WEEKLY"));
+    }
+
+    #[test]
+    fn test_reindex_migrates_broken_flat_rrule_and_reports_it() {
+        // Migration is shape-only, so a legacy file with an unparseable rrule
+        // still migrates to the nested shape.  The post-rewrite re-lint then
+        // reports the bad rule, which is where the user finds out.
+        let dir = create_test_repo();
+        let file = "todo/recurring.md";
+        let content = r#"---
+tldr: Legacy Broken Recurring
+status: todo
+check_in_date: 2026-04-18
+rrule: "FREQ=BOGUS"
+---
+
+Body text.
+"#;
+        let abs = dir.path().join(file);
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        fs::write(&abs, content).unwrap();
+        commit_all(dir.path());
+
+        let result = reindex(dir.path()).unwrap();
+
+        // The doc still indexes — lint errors are data, not aborts.
+        assert_eq!(count_docs(&result.cache), 1);
+
+        let rewritten = fs::read_to_string(&abs).unwrap();
+        assert!(
+            rewritten.contains("recurrence:"),
+            "no recurrence: block:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("\nrrule:"));
+
+        assert!(
+            result.errors.iter().any(
+                |e| e.message.contains("unparseable rrule") && e.message.contains("FREQ=BOGUS")
+            ),
+            "errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]
