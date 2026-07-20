@@ -14,7 +14,8 @@ pub struct TodoArgs {
     #[command(subcommand)]
     command: Option<TodoCommand>,
 
-    /// Only include items up to N days in the future
+    /// Only include active items up to N days in the future and
+    /// done/cancelled items completed within the last N days
     #[arg(long)]
     horizon: Option<u32>,
 
