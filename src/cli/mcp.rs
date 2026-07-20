@@ -32,23 +32,34 @@ impl McpContext {
     /// if provided, otherwise falls back to the server-level default.
     fn resolve_single(&self, tool_repo: Option<&str>) -> Result<ResolvedRepo> {
         let repo_arg = tool_repo.or(self.default_repo.as_deref());
-        super::resolve_single_repo(repo_arg)
+        let manifest = AppManifest::load_default()?;
+        super::resolve_single_repo(repo_arg, manifest.as_ref())
     }
 
     /// Resolve repos for a query (may return multiple).
     fn resolve_all(&self, tool_repo: Option<&str>) -> Result<Vec<ResolvedRepo>> {
         let repo_arg = tool_repo.or(self.default_repo.as_deref());
-        super::resolve_repos(repo_arg)
+        let manifest = AppManifest::load_default()?;
+        super::resolve_repos(repo_arg, manifest.as_ref())
     }
 
     /// Resolve a target document path for mutation tools.
     /// Passes `tool_repo` for conflict detection, server default as fallback.
+    ///
+    /// The manifest is loaded per call (not cached) so tool calls always see
+    /// current manifest edits on this long-running server.
     fn resolve_target(
         &self,
         path_str: &str,
         tool_repo: Option<&str>,
     ) -> Result<(ResolvedRepo, PathBuf)> {
-        super::resolve_target(path_str, tool_repo, self.default_repo.as_deref())
+        let manifest = AppManifest::load_default()?;
+        super::resolve_target(
+            path_str,
+            tool_repo,
+            self.default_repo.as_deref(),
+            manifest.as_ref(),
+        )
     }
 }
 

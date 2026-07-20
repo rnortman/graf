@@ -3,6 +3,7 @@ use std::io::IsTerminal;
 use anyhow::Result;
 use clap::Args;
 
+use graf::manifest::AppManifest;
 use graf::todo;
 
 #[derive(Args)]
@@ -17,7 +18,8 @@ pub struct ReindexArgs {
 }
 
 pub fn run(args: ReindexArgs) -> Result<()> {
-    let resolved = super::resolve_single_repo(args.repo.as_deref())?;
+    let manifest = AppManifest::load_default()?;
+    let resolved = super::resolve_single_repo(args.repo.as_deref(), manifest.as_ref())?;
     let result = todo::reindex(&resolved.path)?;
     let json = args.json || !std::io::stdout().is_terminal();
 
