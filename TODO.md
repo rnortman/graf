@@ -1,21 +1,5 @@
 # TODOs
 
-## `done-error-taxonomy-cleanup`
-
-`DoneError::Invalid(String)` and `DoneError::Infra(anyhow::Error)` (src/todo.rs) are two catch-all variants that every caller must special-case: the MCP layer routes `Infra` to `Err(e)` while emitting the rest as `Ok(envelope)`; CLI JSON mode does the same; CLI human mode stringifies everything. Consider splitting `Invalid` into a small set of named variants (path-not-md, replacing-with-no-stored, replacing-redundant, missing-anchor) so frontends can branch on named codes, and keeping `Infra` as the sole catch-all with a `DoneError::is_infra()` predicate so callers don't pattern-match on the specific variant.
-
-## `done-error-derive-serialize`
-
-`DoneError::to_json` (src/todo.rs) hand-rolls the `{error, reason, ...payload}` envelope by mutating a `serde_json::Value`. A `#[derive(Serialize)]` with `#[serde(tag = "error", rename_all = "snake_case")]` would replace the 80-line `code()` / `to_json()` pair with framework-driven serialization; the `reason` string can stay computed in a `reason()` accessor. Phase 3 added `ScheduleError` with the same hand-rolled idiom (code/reason/to_json/Display/Error/From<anyhow>) — the pattern is now load-bearing for two error types, with a likely third (`ReorderError`, `CancelError`) each time a mutator grows structured errors. Sweep both (all) enums together; the refactor is purely mechanical, no semantic change.
-
-## `done-anchored-double-rrule-parse`
-
-`done_anchored` in src/todo.rs parses and iterates the rrule twice on the stale-anchor branch — once via `compute_next_occurrence` for the naive next anchor, once via `compute_occurrence_after` for the skip-past target. A single helper that returns both values in one iteration would halve the parse+iterate work. Once per user action, so the impact is negligible; cleanup only.
-
-## `workspace-handle`
-
-Multiple callers carry `repo_dir` in their Options structs and independently call `open_and_sync`. Consider a higher-level `Workspace` handle that wraps `repo_dir` + `Cache`, so callers share a single entry point. See `db.rs`.
-
 ## `cross-repo-ref-validation`
 
 `graf manifest check` validates manifest-level consistency (slugs unique, IDs match, paths exist) but does not validate cross-repo refs. A repo's `.graf/config.toml` `refs` section maps slugs to global IDs — `check` could verify those IDs exist in the application manifest and that the slugs don't conflict. Deferred per design doc: "Cross-repo ref validation (do slugs in refs resolve?) is deferred."
@@ -44,11 +28,7 @@ The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and hor
 
 `resolve_target` unit tests call the real `AppManifest::load_default()`, so results depend on whether the user's `~/.config/graf/manifest.toml` exists and what slugs it contains. The function should accept a manifest (or manifest loader) as a parameter instead of reading the global config implicitly. This would also make `resolve_target` more testable in general. See `cli/mod.rs` `resolve_target()` and its tests.
 
-## `mcp-preflight-shared-error-type`
-
-`DoneError::PathNotFound`/`InvalidDate` (`src/todo.rs`) and `ScheduleError::PathNotFound`/`InvalidDate` (`src/todo.rs`) are structurally identical variants with identical `code()`, `reason()`, and `to_json()` arms. When `cancel-mcp-envelope` lands a third copy will appear. Extract a shared `McpPreflightError` enum (in `src/cli/mcp.rs` or a new `src/cli/mcp_errors.rs`) and embed it via a variant in each tool-specific error enum. Best tackled alongside `done-error-derive-serialize`. See `TODO(mcp-preflight-shared-error-type)` comment at `src/todo.rs`.
-
-## `recurring-phase-2-remove-flat-rrule`
+## `recurring-phase-2-remove-flat-rrule` — BLOCKED as of 2026-07-20
 
 `Frontmatter.rrule: Option<String>` is retained as a legacy-shape compat field (`src/frontmatter.rs`). Reindex eagerly migrates old files into the nested `recurrence` block, and no write path emits flat `rrule`. Once we're confident no repos still carry legacy-shape files (or are willing to surface them as parse errors for manual fix-up), remove the field and the associated `Field::Rrule` variant, plus the legacy-compat branches in `maybe_migrate_legacy` and `effective_rrule`.
 
