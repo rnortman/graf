@@ -45,9 +45,14 @@ impl ResolvedRepo {
 /// When `--repo` is not given:
 ///   - If a manifest exists: return all repos in the manifest.
 ///   - Otherwise: return cwd as a single repo.
-pub fn resolve_repos(repo_arg: Option<&str>) -> Result<Vec<ResolvedRepo>> {
-    let manifest = AppManifest::load_default()?;
-
+///
+/// The caller supplies the manifest (normally from `AppManifest::load_default()`).
+/// `None` means no manifest is active, driving the cwd fallback and the
+/// "no manifest found" slug errors.
+pub fn resolve_repos(
+    repo_arg: Option<&str>,
+    manifest: Option<&AppManifest>,
+) -> Result<Vec<ResolvedRepo>> {
     match repo_arg {
         Some(arg) => {
             if looks_like_path(arg) {
@@ -57,6 +62,8 @@ pub fn resolve_repos(repo_arg: Option<&str>) -> Result<Vec<ResolvedRepo>> {
             } else {
                 // Slug lookup
                 let slug = Slug::new(arg).with_context(|| format!("invalid repo slug: {arg}"))?;
+                // TODO(resolve-slug-arm-duplication): shares logic with the
+                // resolve_target Qualified arm below.
                 let manifest = manifest.ok_or_else(|| {
                     anyhow::anyhow!(
                         "no manifest found — cannot resolve slug {arg:?}. \
@@ -105,8 +112,13 @@ pub fn resolve_repos(repo_arg: Option<&str>) -> Result<Vec<ResolvedRepo>> {
 }
 
 /// Resolve repos, but require exactly one result.  Used by mutation commands.
-pub fn resolve_single_repo(repo_arg: Option<&str>) -> Result<ResolvedRepo> {
-    let repos = resolve_repos(repo_arg)?;
+///
+/// The caller supplies the manifest (normally from `AppManifest::load_default()`).
+pub fn resolve_single_repo(
+    repo_arg: Option<&str>,
+    manifest: Option<&AppManifest>,
+) -> Result<ResolvedRepo> {
+    let repos = resolve_repos(repo_arg, manifest)?;
     if repos.len() > 1 {
         bail!("multiple repos found in manifest — specify --repo for this command");
     }
@@ -128,10 +140,13 @@ pub fn resolve_single_repo(repo_arg: Option<&str>) -> Result<ResolvedRepo> {
 ///
 /// `default_repo` is a fallback for bare paths when `repo_arg` is `None`.
 /// Used by MCP tools to pass the server-level `--repo` default. CLI callers pass `None`.
+///
+/// The caller supplies the manifest (normally from `AppManifest::load_default()`).
 pub fn resolve_target(
     path_str: &str,
     repo_arg: Option<&str>,
     default_repo: Option<&str>,
+    manifest: Option<&AppManifest>,
 ) -> Result<(ResolvedRepo, PathBuf)> {
     let doc_ref = DocRef::parse(path_str).with_context(|| format!("invalid path: {path_str:?}"))?;
 
@@ -143,7 +158,9 @@ pub fn resolve_target(
                      but --repo was also specified"
                 );
             }
-            let manifest = AppManifest::load_default()?.ok_or_else(|| {
+            // TODO(resolve-slug-arm-duplication): shares logic with the
+            // resolve_repos slug arm above.
+            let manifest = manifest.ok_or_else(|| {
                 anyhow::anyhow!("no manifest found — cannot resolve slug in path {path_str:?}")
             })?;
             let entry = manifest.find_repo_by_slug(&slug).ok_or_else(|| {
@@ -162,7 +179,7 @@ pub fn resolve_target(
         }
         DocRef::Bare(path) => {
             let effective_repo = repo_arg.or(default_repo);
-            let repo = resolve_single_repo(effective_repo)?;
+            let repo = resolve_single_repo(effective_repo, manifest)?;
             Ok((repo, path))
         }
         DocRef::Uri(_) => {
@@ -730,12 +747,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_target tests
+    // resolve_* tests
     // -----------------------------------------------------------------------
+
+    use graf::manifest::ManifestRepo;
+    use tempfile::TempDir;
+
+    /// Create a temp repo dir containing a minimal `.graf/config.toml`, and
+    /// return the dir guard plus a matching `ManifestRepo` entry.
+    fn test_repo(slug: &str, domain: Option<&str>) -> (TempDir, ManifestRepo) {
+        let dir = TempDir::new().unwrap();
+        let slug = Slug::new(slug).unwrap();
+        let id = GlobalId::new(&format!("example.com/{slug}")).unwrap();
+        let config = RepoConfig {
+            id: id.clone(),
+            default_slug: slug.clone(),
+            domain: domain.map(|d| GlobalId::new(d).unwrap()),
+            refs: Default::default(),
+        };
+        config.save(dir.path()).unwrap();
+        let repo = ManifestRepo {
+            slug,
+            path: dir.path().to_string_lossy().into_owned(),
+            id,
+        };
+        (dir, repo)
+    }
+
+    /// Build an in-memory manifest from repo entries (no domains).
+    fn manifest_of(repos: Vec<ManifestRepo>) -> AppManifest {
+        AppManifest {
+            repo: repos,
+            domain: Vec::new(),
+        }
+    }
 
     #[test]
     fn resolve_target_conflict_slug_path_with_repo_arg() {
-        let err = resolve_target("life:todo/foo.md", Some("life"), None).unwrap_err();
+        let err = resolve_target("life:todo/foo.md", Some("life"), None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("conflicting repo"),
@@ -745,7 +794,7 @@ mod tests {
 
     #[test]
     fn resolve_target_conflict_different_slug_and_repo() {
-        let err = resolve_target("life:todo/foo.md", Some("work"), None).unwrap_err();
+        let err = resolve_target("life:todo/foo.md", Some("work"), None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("conflicting repo"),
@@ -755,7 +804,8 @@ mod tests {
 
     #[test]
     fn resolve_target_uri_rejected() {
-        let err = resolve_target("graf://example.com/life/todo/foo.md", None, None).unwrap_err();
+        let err =
+            resolve_target("graf://example.com/life/todo/foo.md", None, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("graf:// URIs not yet supported"),
@@ -765,44 +815,148 @@ mod tests {
 
     #[test]
     fn resolve_target_qualified_no_conflict_with_default_repo() {
-        // A qualified path should not conflict with default_repo (only repo_arg).
-        // May succeed or fail depending on whether a manifest exists with this
-        // slug — either outcome is fine as long as there's no conflict error.
-        // TODO(resolve-target-env-isolation)
-        let result = resolve_target("life:todo/foo.md", None, Some("life"));
-        if let Err(e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("conflicting repo"),
-                "default_repo should not trigger conflict, got: {msg}"
-            );
-        }
+        // A qualified path resolves via its own slug; default_repo is ignored on
+        // that branch (only repo_arg conflicts). default_repo points at a
+        // *different* repo to prove it does not steer the result.
+        let (life_dir, life) = test_repo("life", None);
+        let (_other_dir, other) = test_repo("other", None);
+        let manifest = manifest_of(vec![life, other]);
+        let (resolved, path) =
+            resolve_target("life:todo/foo.md", None, Some("other"), Some(&manifest)).unwrap();
+        assert_eq!(resolved.slug.as_ref().unwrap().to_string(), "life");
+        assert_eq!(resolved.path, life_dir.path());
+        assert_eq!(path, PathBuf::from("todo/foo.md"));
+    }
+
+    #[test]
+    fn resolve_target_qualified_unknown_slug() {
+        let (_dir, repo) = test_repo("life", None);
+        let manifest = manifest_of(vec![repo]);
+        let err = resolve_target("work:todo/foo.md", None, None, Some(&manifest)).unwrap_err();
+        assert!(err.to_string().contains("unknown repo slug"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_target_qualified_no_manifest() {
+        let err = resolve_target("life:todo/foo.md", None, None, None).unwrap_err();
+        assert!(err.to_string().contains("no manifest found"), "got: {err}");
     }
 
     #[test]
     fn resolve_target_bare_path_uses_default_repo() {
-        // With a bare path, repo_arg=None, and default_repo=Some("nonexistent"),
-        // resolve_target should attempt to resolve "nonexistent" as a slug.
-        // It will fail (no manifest), but the error should reference the slug —
-        // proving the default_repo was used rather than falling through to cwd.
-        let err = resolve_target("todo/foo.md", None, Some("nonexistent")).unwrap_err();
-        let msg = err.to_string();
-        // resolve_single_repo tries Slug::new("nonexistent") which succeeds,
-        // then looks up in manifest — the error proves default_repo was passed through.
-        assert!(
-            msg.contains("nonexistent"),
-            "error should reference the default_repo slug, got: {msg}"
-        );
+        // default_repo=Some("nonexistent") with a manifest lacking it → the slug
+        // lookup fails, proving default_repo was used (not a cwd fall-through).
+        let (_dir, repo) = test_repo("life", None);
+        let manifest = manifest_of(vec![repo]);
+        let err =
+            resolve_target("todo/foo.md", None, Some("nonexistent"), Some(&manifest)).unwrap_err();
+        assert!(err.to_string().contains("unknown repo slug"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_target_bare_path_default_repo_positive() {
+        let (dir, repo) = test_repo("life", None);
+        let manifest = manifest_of(vec![repo]);
+        let (resolved, path) =
+            resolve_target("todo/foo.md", None, Some("life"), Some(&manifest)).unwrap();
+        assert_eq!(resolved.slug.as_ref().unwrap().to_string(), "life");
+        assert_eq!(resolved.path, dir.path());
+        assert_eq!(path, PathBuf::from("todo/foo.md"));
     }
 
     #[test]
     fn resolve_target_bare_path_repo_arg_takes_precedence_over_default() {
-        // When both repo_arg and default_repo are set, repo_arg wins for bare paths.
-        let err = resolve_target("todo/foo.md", Some("explicit"), Some("default")).unwrap_err();
-        let msg = err.to_string();
+        // With both repo_arg and default_repo set, repo_arg wins: the resolved
+        // repo is `explicit`, not `default`.
+        let (explicit_dir, explicit) = test_repo("explicit", None);
+        let (_default_dir, default) = test_repo("default", None);
+        let manifest = manifest_of(vec![explicit, default]);
+        let (resolved, _path) = resolve_target(
+            "todo/foo.md",
+            Some("explicit"),
+            Some("default"),
+            Some(&manifest),
+        )
+        .unwrap();
+        assert_eq!(resolved.slug.as_ref().unwrap().to_string(), "explicit");
+        assert_eq!(resolved.path, explicit_dir.path());
+    }
+
+    #[test]
+    fn resolve_repos_no_arg_returns_all_in_order() {
+        let (_a_dir, a) = test_repo("alpha", None);
+        let (_b_dir, b) = test_repo("beta", None);
+        let manifest = manifest_of(vec![a, b]);
+        let repos = resolve_repos(None, Some(&manifest)).unwrap();
+        let slugs: Vec<String> = repos
+            .iter()
+            .map(|r| r.slug.as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(slugs, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn resolve_repos_slug_plumbs_domain_from_config() {
+        let (_dir, repo) = test_repo("life", Some("example.com/household"));
+        let manifest = manifest_of(vec![repo]);
+        let repos = resolve_repos(Some("life"), Some(&manifest)).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].slug.as_ref().unwrap().to_string(), "life");
+        assert_eq!(
+            repos[0].domain.as_ref().map(|d| d.to_string()),
+            Some("example.com/household".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_repos_slug_no_manifest() {
+        let err = resolve_repos(Some("life"), None).unwrap_err();
+        assert!(err.to_string().contains("no manifest found"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_repos_no_arg_no_manifest_falls_back_to_cwd() {
+        let repos = resolve_repos(None, None).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].path, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn resolve_repos_no_arg_empty_manifest_falls_back_to_cwd() {
+        // A present-but-empty manifest with no --repo falls to cwd, same as no
+        // manifest at all.
+        let manifest = manifest_of(vec![]);
+        let repos = resolve_repos(None, Some(&manifest)).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].path, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn resolve_single_repo_multiple_repos_errors() {
+        let (_a_dir, a) = test_repo("alpha", None);
+        let (_b_dir, b) = test_repo("beta", None);
+        let manifest = manifest_of(vec![a, b]);
+        let err = resolve_single_repo(None, Some(&manifest)).unwrap_err();
         assert!(
-            msg.contains("explicit"),
-            "error should reference repo_arg not default_repo, got: {msg}"
+            err.to_string().contains("multiple repos found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_repos_slug_missing_config_errors() {
+        // Manifest entry pointing at a dir without `.graf/config.toml`.
+        let dir = TempDir::new().unwrap();
+        let repo = ManifestRepo {
+            slug: Slug::new("life").unwrap(),
+            path: dir.path().to_string_lossy().into_owned(),
+            id: GlobalId::new("example.com/repo").unwrap(),
+        };
+        let manifest = manifest_of(vec![repo]);
+        let err = resolve_repos(Some("life"), Some(&manifest)).unwrap_err();
+        assert!(
+            err.to_string().contains("no .graf/config.toml"),
+            "got: {err}"
         );
     }
 }

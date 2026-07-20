@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Args;
 
 use graf::lint::{self, LintOptions};
+use graf::manifest::AppManifest;
 
 #[derive(Args)]
 pub struct FixArgs {
@@ -15,7 +16,8 @@ pub struct FixArgs {
 }
 
 pub fn run(args: FixArgs) -> Result<()> {
-    let resolved = super::resolve_single_repo(args.repo.as_deref())?;
+    let manifest = AppManifest::load_default()?;
+    let resolved = super::resolve_single_repo(args.repo.as_deref(), manifest.as_ref())?;
     let options = LintOptions {
         fix: true,
         repo_dir: resolved.path,

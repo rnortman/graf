@@ -3,6 +3,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use graf::lint::{self, LintResult};
+use graf::manifest::AppManifest;
 
 #[derive(Args)]
 pub struct LintArgs {
@@ -32,10 +33,14 @@ pub fn run(args: LintArgs) -> Result<()> {
         bail!("--changed and explicit file paths are mutually exclusive");
     }
 
+    let manifest = AppManifest::load_default()?;
     let repos = if !args.files.is_empty() {
-        vec![super::resolve_single_repo(args.repo.as_deref())?]
+        vec![super::resolve_single_repo(
+            args.repo.as_deref(),
+            manifest.as_ref(),
+        )?]
     } else {
-        super::resolve_repos(args.repo.as_deref())?
+        super::resolve_repos(args.repo.as_deref(), manifest.as_ref())?
     };
 
     let combined = super::multi_repo_lint(

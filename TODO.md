@@ -20,10 +20,6 @@ The SQL `ORDER BY` in `db.rs` and the Rust `todo_sort_cmp()` in `cli/mod.rs` enc
 
 The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and horizon WHERE clauses of `db.rs`. These are hardcoded string literals that must stay in sync with `Status::Done` and `Status::Cancelled` serialization. If a new terminal status were added, these would need manual updates found only by text search. Consider building the SQL fragment from `Status::is_terminal()` variants or a shared constant.
 
-## `resolve-target-env-isolation`
-
-`resolve_target` unit tests call the real `AppManifest::load_default()`, so results depend on whether the user's `~/.config/graf/manifest.toml` exists and what slugs it contains. The function should accept a manifest (or manifest loader) as a parameter instead of reading the global config implicitly. This would also make `resolve_target` more testable in general. See `cli/mod.rs` `resolve_target()` and its tests.
-
 ## `recurring-phase-2-remove-flat-rrule` — BLOCKED as of 2026-07-20
 
 `Frontmatter.rrule: Option<String>` is retained as a legacy-shape compat field (`src/frontmatter.rs`). Reindex eagerly migrates old files into the nested `recurrence` block, and no write path emits flat `rrule`. Once we're confident no repos still carry legacy-shape files (or are willing to surface them as parse errors for manual fix-up), remove the field and the associated `Field::Rrule` variant, plus the legacy-compat branches in `maybe_migrate_legacy` and `effective_rrule`.
@@ -34,6 +30,20 @@ Lint-rule violations are persisted per-doc in `docs.lint_errors`, so `graf todo`
 
 Persisting these means keeping rows for files with no valid frontmatter, which have no `tldr` and no dates: either a nullable-everything doc row or a separate errors table. That is a schema question of its own, and was out of scope for the lint-persistence work. Until then, `graf lint` remains the way to surface standing parse failures.
 
+
+## `resolve-slug-arm-duplication`
+
+`resolve_repos`' slug arm (`src/cli/mod.rs`) and `resolve_target`'s
+`DocRef::Qualified` arm independently perform the same sequence:
+`find_repo_by_slug` → error on miss → `AppManifest::expand_path` →
+`load_repo_config_required` → construct `ResolvedRepo`. The "unknown repo slug"
+error wording has already diverged slightly between the two arms, and any future
+per-repo metadata added to `ResolvedRepo` must be plumbed twice. Now that both
+arms share a `manifest: Option<&AppManifest>` parameter, extract
+`fn resolve_manifest_slug(manifest: &AppManifest, slug: &Slug) -> Result<ResolvedRepo>`
+and call it from both. Deferred: the resolver-threading design deliberately
+scoped to "plain data parameter, no restructuring," so this cleanup is a
+separate change.
 
 ## `frozen-series-effective-date`
 

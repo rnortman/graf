@@ -7,6 +7,7 @@ use clap::{Args, Subcommand};
 use graf::clock::Clock;
 use graf::config::AppConfig;
 use graf::frontmatter::{Effort, Recurrence, Status};
+use graf::manifest::AppManifest;
 use graf::todo::{self, AddOptions, CancelOptions, DoneOptions, ReorderOptions, ScheduleOptions};
 
 #[derive(Args)]
@@ -113,7 +114,8 @@ pub fn run(args: TodoArgs) -> Result<()> {
 }
 
 fn run_query(args: TodoArgs) -> Result<()> {
-    let repos = super::resolve_repos(args.repo.as_deref())?;
+    let manifest = AppManifest::load_default()?;
+    let repos = super::resolve_repos(args.repo.as_deref(), manifest.as_ref())?;
     let statuses = parse_statuses(&args.status)?;
     let multi_repo = repos.len() > 1;
 
@@ -148,7 +150,9 @@ fn run_query(args: TodoArgs) -> Result<()> {
 }
 
 fn run_add(args: AddArgs, json: bool) -> Result<()> {
-    let (resolved, path) = super::resolve_target(&args.path, args.repo.as_deref(), None)?;
+    let manifest = AppManifest::load_default()?;
+    let (resolved, path) =
+        super::resolve_target(&args.path, args.repo.as_deref(), None, manifest.as_ref())?;
 
     let recurrence = match (args.rrule.as_deref(), args.lead_days) {
         (Some(rrule), lead_days) => Some(Recurrence {
@@ -276,7 +280,9 @@ struct ReorderArgs {
 }
 
 fn run_done(args: DoneArgs, json: bool) -> Result<()> {
-    let (resolved, path) = super::resolve_target(&args.path, args.repo.as_deref(), None)?;
+    let manifest = AppManifest::load_default()?;
+    let (resolved, path) =
+        super::resolve_target(&args.path, args.repo.as_deref(), None, manifest.as_ref())?;
     let call_result = todo::todo_done(&DoneOptions {
         repo_dir: resolved.path,
         path,
@@ -365,7 +371,9 @@ fn run_done(args: DoneArgs, json: bool) -> Result<()> {
 }
 
 fn run_cancel(args: CancelArgs, json: bool) -> Result<()> {
-    let (resolved, path) = super::resolve_target(&args.path, args.repo.as_deref(), None)?;
+    let manifest = AppManifest::load_default()?;
+    let (resolved, path) =
+        super::resolve_target(&args.path, args.repo.as_deref(), None, manifest.as_ref())?;
     let result = todo::todo_cancel(&CancelOptions {
         repo_dir: resolved.path,
         path,
@@ -390,7 +398,9 @@ fn run_cancel(args: CancelArgs, json: bool) -> Result<()> {
 }
 
 fn run_schedule(args: ScheduleArgs, json: bool) -> Result<()> {
-    let (resolved, path) = super::resolve_target(&args.path, args.repo.as_deref(), None)?;
+    let manifest = AppManifest::load_default()?;
+    let (resolved, path) =
+        super::resolve_target(&args.path, args.repo.as_deref(), None, manifest.as_ref())?;
     let call_result = todo::todo_schedule(&ScheduleOptions {
         repo_dir: resolved.path,
         path,
@@ -431,8 +441,9 @@ fn run_schedule(args: ScheduleArgs, json: bool) -> Result<()> {
 }
 
 fn run_reorder(args: ReorderArgs, json: bool) -> Result<()> {
-    let (resolved, path) = super::resolve_target(&args.path, args.repo.as_deref(), None)?;
-    let manifest = graf::manifest::AppManifest::load_default()?;
+    let manifest = AppManifest::load_default()?;
+    let (resolved, path) =
+        super::resolve_target(&args.path, args.repo.as_deref(), None, manifest.as_ref())?;
     let target_sync = graf::db::open_and_sync(&resolved.path)?;
 
     let after = args
