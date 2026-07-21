@@ -225,10 +225,7 @@ fn validate(
         let mut done: Vec<Instance> = Vec::new();
 
         for inst in ctrl_instances.drain(..) {
-            let is_terminal = matches!(
-                inst.fm.status,
-                Some(frontmatter::Status::Done | frontmatter::Status::Cancelled)
-            );
+            let is_terminal = inst.fm.status.as_ref().is_some_and(|s| s.is_terminal());
             if is_terminal {
                 done.push(inst);
             } else {

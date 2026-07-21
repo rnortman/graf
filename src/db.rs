@@ -39,6 +39,10 @@ pub(crate) const SCHEMA_VERSION: &str = "8";
 /// `on_date`.  TODO(frozen-series-effective-date)
 const EFF_DATE: &str = "COALESCE(tentative_date, check_in_date, on_date, end_date, due_date)";
 
+/// SQL tuple of terminal statuses. Must match Status::is_terminal() over
+/// Status::ALL in declaration order — asserted by status_sql_literals_match_enum.
+const TERMINAL_STATUSES_SQL: &str = "('done', 'cancelled')";
+
 const SCHEMA_DDL: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -69,7 +73,7 @@ CREATE TABLE IF NOT EXISTS docs (
 CREATE INDEX IF NOT EXISTS idx_active_effective_date ON docs(
     COALESCE(tentative_date, check_in_date, on_date, end_date, due_date),
     COALESCE(sort_order, priority, 6)  -- must match frontmatter::rank(); 6 = frontmatter::UNRANKED
-) WHERE status IN ('todo', 'in_progress', 'reminder');
+) WHERE status IN ('todo', 'in_progress', 'reminder');  -- active statuses; asserted by status_sql_literals_match_enum
 
 CREATE INDEX IF NOT EXISTS idx_status ON docs(status, on_date, end_date);
 ";
@@ -282,11 +286,11 @@ impl Cache {
         // Status filter
         let mut statuses: Vec<String> = filter.statuses.iter().map(|s| s.to_string()).collect();
         if filter.include_done {
-            if !statuses.iter().any(|s| s == "done") {
-                statuses.push("done".to_string());
-            }
-            if !statuses.iter().any(|s| s == "cancelled") {
-                statuses.push("cancelled".to_string());
+            for s in Status::ALL.iter().filter(|s| s.is_terminal()) {
+                let s = s.to_string();
+                if !statuses.contains(&s) {
+                    statuses.push(s);
+                }
             }
         }
         if statuses.is_empty() {
@@ -339,11 +343,10 @@ impl Cache {
 
             let p_upper = qb.push_param(upper.to_string());
             let p_lower = qb.push_param(lower.to_string());
-            // TODO(sql-terminal-status-strings)
             qb.push_str(&format!(
-                " AND ((status IN ('done', 'cancelled') \
+                " AND ((status IN {TERMINAL_STATUSES_SQL} \
                  AND ({EFF_DATE} IS NULL OR {EFF_DATE} >= {p_lower})) \
-                 OR (status NOT IN ('done', 'cancelled') \
+                 OR (status NOT IN {TERMINAL_STATUSES_SQL} \
                  AND {EFF_DATE} IS NOT NULL AND {EFF_DATE} <= {p_upper}))"
             ));
         }
@@ -359,10 +362,9 @@ impl Cache {
         // This must match todo_sort_cmp() in cli/mod.rs; the rank term is the
         // canonical formula frontmatter::rank(). Guarded by the multi-repo sort
         // integration tests.
-        // TODO(sql-terminal-status-strings)
         // ORDER BY: active items first, then by effective date, rank, title.
         qb.push_str(&format!(
-            " ORDER BY status IN ('done', 'cancelled'), \
+            " ORDER BY status IN {TERMINAL_STATUSES_SQL}, \
              {EFF_DATE} IS NULL, {EFF_DATE}, \
              COALESCE(sort_order, priority, {unranked}), tldr",
             unranked = frontmatter::UNRANKED as i64
@@ -888,6 +890,38 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn status_sql_literals_match_enum() {
+        // Derive the terminal and active tuples from the enum, preserving
+        // Status::ALL declaration order.
+        let render = |statuses: &[String]| format!("('{}')", statuses.join("', '"));
+        let terminal: Vec<String> = Status::ALL
+            .iter()
+            .filter(|s| s.is_terminal())
+            .map(|s| s.to_string())
+            .collect();
+        let active: Vec<String> = Status::ALL
+            .iter()
+            .filter(|s| !s.is_terminal())
+            .map(|s| s.to_string())
+            .collect();
+        let derived_terminal = render(&terminal);
+        let derived_active = render(&active);
+
+        // Covers the two runtime format! call sites that consume the constant.
+        assert_eq!(TERMINAL_STATUSES_SQL, derived_terminal);
+        // Covers the schema partial-index predicate.
+        assert!(
+            SCHEMA_DDL.contains(&format!("WHERE status IN {derived_active}")),
+            "SCHEMA_DDL active-status predicate does not match enum-derived {derived_active}"
+        );
+
+        // SQL-quoting safety of the generated tuples.
+        for s in Status::ALL.iter().map(|s| s.to_string()) {
+            assert!(!s.contains('\''), "status {s:?} contains a single quote");
+        }
+    }
 
     // -- Test helpers --
 
