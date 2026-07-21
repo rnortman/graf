@@ -28,6 +28,7 @@ release-musl:
 fmt:
 	cargo fmt -- --check
 
+# TODO(clippy-gate-skips-tests): no --all-targets, so test code is ungated.
 clippy:
 	cargo clippy -- -D warnings
 

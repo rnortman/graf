@@ -5,19 +5,43 @@ use serde::Deserialize;
 
 const DEFAULT_TODO_LIMIT: usize = 100;
 
+/// Resolve graf's config directory: `$XDG_CONFIG_HOME/graf`, falling back
+/// to `$HOME/.config/graf`. Callers append their own filename.
+pub fn graf_config_dir() -> Result<PathBuf> {
+    graf_config_dir_from(
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// Pure core of [`graf_config_dir`]: `None` means the variable is unset.
+/// Separated so unit tests need no env mutation.
+fn graf_config_dir_from(xdg_config_home: Option<String>, home: Option<String>) -> Result<PathBuf> {
+    let root = match xdg_config_home {
+        // TODO(xdg-empty-unset): an empty XDG_CONFIG_HOME is used verbatim; the
+        // XDG spec says empty means unset (fall back to $HOME/.config).
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = home.context("HOME environment variable not set")?;
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(root.join("graf"))
+}
+
 /// Application-level config, loaded from `~/.config/graf/config.toml`.
 ///
 /// Unlike `AppManifest` (identity/location registry), this holds user
 /// preferences and behavioral defaults.  Always returns a value — uses
 /// built-in defaults when no file exists.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub todo: TodoConfig,
 }
 
 /// Todo-related config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TodoConfig {
     /// Default limit for todo queries when no explicit `--limit` is given.
@@ -48,19 +72,12 @@ impl AppConfig {
     /// Determine the config file path.
     ///
     /// Uses `GRAF_CONFIG` env var if set, otherwise `~/.config/graf/config.toml`.
-    // TODO(xdg-path-duplication)
     pub fn default_path() -> Result<PathBuf> {
         if let Ok(p) = std::env::var("GRAF_CONFIG") {
             return Ok(PathBuf::from(p));
         }
-        let config_dir = match std::env::var("XDG_CONFIG_HOME") {
-            Ok(dir) => PathBuf::from(dir),
-            Err(_) => {
-                let home = std::env::var("HOME").context("HOME environment variable not set")?;
-                PathBuf::from(home).join(".config")
-            }
-        };
-        Ok(config_dir.join("graf/config.toml"))
+        let config_dir = graf_config_dir()?;
+        Ok(config_dir.join("config.toml"))
     }
 
     /// Load from the default path.  Returns defaults if the file doesn't exist.
@@ -126,5 +143,29 @@ mod tests {
     fn absent_limit_uses_default() {
         let config: AppConfig = toml::from_str("[todo]\n").unwrap();
         assert_eq!(config.todo.default_limit, Some(100));
+    }
+
+    #[test]
+    fn config_dir_uses_xdg_when_set() {
+        let dir = graf_config_dir_from(Some("/xdg/dir".to_string()), None).unwrap();
+        assert_eq!(dir, PathBuf::from("/xdg/dir/graf"));
+    }
+
+    #[test]
+    fn config_dir_falls_back_to_home_dot_config() {
+        let dir = graf_config_dir_from(None, Some("/home/u".to_string())).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/u/.config/graf"));
+    }
+
+    #[test]
+    fn config_dir_errors_without_home() {
+        let err = graf_config_dir_from(None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("HOME"));
+    }
+
+    #[test]
+    fn config_dir_honors_empty_xdg_verbatim() {
+        let dir = graf_config_dir_from(Some(String::new()), Some("/home/u".to_string())).unwrap();
+        assert_eq!(dir, PathBuf::from("graf"));
     }
 }
