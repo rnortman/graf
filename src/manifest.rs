@@ -133,14 +133,8 @@ impl AppManifest {
         if let Ok(p) = std::env::var("GRAF_MANIFEST") {
             return Ok(PathBuf::from(p));
         }
-        let config_dir = match std::env::var("XDG_CONFIG_HOME") {
-            Ok(dir) => PathBuf::from(dir),
-            Err(_) => {
-                let home = std::env::var("HOME").context("HOME environment variable not set")?;
-                PathBuf::from(home).join(".config")
-            }
-        };
-        Ok(config_dir.join("graf/manifest.toml"))
+        let config_dir = crate::config::graf_config_dir()?;
+        Ok(config_dir.join("manifest.toml"))
     }
 
     /// Load from the default path. Returns `None` if the file doesn't exist.

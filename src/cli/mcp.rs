@@ -6,6 +6,7 @@ use chrono::NaiveDate;
 use clap::Args;
 use serde_json::{Value, json};
 
+use graf::config::AppConfig;
 use graf::frontmatter::{Effort, Recurrence, Status};
 use graf::lint::{self, LintOptions};
 use graf::manifest::AppManifest;
@@ -25,6 +26,8 @@ pub struct McpArgs {
 struct McpContext {
     /// Default repo from --repo flag at server startup.
     default_repo: Option<String>,
+    /// App config, loaded once at server startup.
+    config: AppConfig,
 }
 
 impl McpContext {
@@ -86,6 +89,7 @@ graf_ref_attachments, graf_ref_links, graf_ref_context_link.";
 pub fn run(args: McpArgs) -> Result<()> {
     let ctx = McpContext {
         default_repo: args.repo,
+        config: AppConfig::load_default()?,
     };
 
     let server = Server::new("graf", env!("CARGO_PKG_VERSION"))
@@ -487,10 +491,8 @@ impl Tool for TodoQueryTool {
 
     fn call(&self, args: Value) -> Result<Value> {
         let repos = self.0.resolve_all(args["repo"].as_str())?;
-        // TODO(mcp-config-caching)
-        let config = graf::config::AppConfig::load_default()?;
         let explicit_limit = args["limit"].as_u64().map(|v| v as usize);
-        let limit = explicit_limit.or(config.todo.effective_limit());
+        let limit = explicit_limit.or(self.0.config.todo.effective_limit());
 
         let result = super::multi_repo_todo_query(
             &repos,
@@ -1217,6 +1219,7 @@ mod tests {
     fn cancel_tool_ctx(dir: &TempDir) -> TodoCancelTool {
         TodoCancelTool(McpContext {
             default_repo: Some(dir.path().to_str().unwrap().to_string()),
+            config: AppConfig::default(),
         })
     }
 
@@ -1323,7 +1326,10 @@ mod tests {
 
     #[test]
     fn cancel_schema_requires_today() {
-        let tool = TodoCancelTool(McpContext { default_repo: None });
+        let tool = TodoCancelTool(McpContext {
+            default_repo: None,
+            config: AppConfig::default(),
+        });
         let schema = tool.input_schema();
         let required = schema["required"].as_array().expect("required is array");
         let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();

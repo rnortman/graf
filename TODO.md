@@ -1,13 +1,5 @@
 # TODOs
 
-## `mcp-config-caching`
-
-`AppConfig::load_default()` is called on every MCP `graf_todo_query` tool call, re-reading and parsing the config file from disk each time. The MCP server is long-lived and config won't change mid-session. Load the config once at server startup and store it in `McpContext`, then reference it from tool `call()` methods without per-request I/O.
-
-## `xdg-path-duplication`
-
-`AppConfig::default_path()` and `AppManifest::default_path()` both implement the same XDG config directory logic (`XDG_CONFIG_HOME` → fallback `~/.config`). Extract a shared `graf_config_dir()` helper when a third caller appears.
-
 ## `sql-terminal-status-strings`
 
 The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and horizon WHERE clauses of `db.rs`. These are hardcoded string literals that must stay in sync with `Status::Done` and `Status::Cancelled` serialization. If a new terminal status were added, these would need manual updates found only by text search. Consider building the SQL fragment from `Status::is_terminal()` variants or a shared constant.
@@ -36,6 +28,30 @@ arms share a `manifest: Option<&AppManifest>` parameter, extract
 and call it from both. Deferred: the resolver-threading design deliberately
 scoped to "plain data parameter, no restructuring," so this cleanup is a
 separate change.
+
+## `xdg-empty-unset`
+
+`graf_config_dir_from()` (`src/config.rs`) uses an empty-but-set
+`$XDG_CONFIG_HOME` verbatim, resolving config/manifest relative to the process
+CWD. The XDG Base Directory spec requires an empty variable to be treated as
+unset (fall back to `$HOME/.config`). The behavior is pre-existing (the old
+`env::var` block did the same) and was deliberately preserved as a pure
+extraction — the `config_dir_honors_empty_xdg_verbatim` test pins it so a future
+fix is a deliberate change. Fixing it (`xdg_config_home.filter(|s|
+!s.is_empty())`, invert the test) is a behavior change with CI/systemd/container
+blast radius, so it is deferred to a design decision rather than folded into a
+refactor.
+
+## `clippy-gate-skips-tests`
+
+The `make check` clippy gate (`Makefile`, `clippy:` target) runs `cargo clippy
+-- -D warnings` without `--all-targets`, so test code is ungated. `cargo clippy
+--all-targets` currently emits ~25 warnings in test modules (useless `vec!`,
+redundant closures, etc.). CLAUDE.md's "clippy must pass with no warnings" thus
+holds only for lib/bin code while test-code lint rot accumulates silently. The
+warnings predate this work. Fixing means adding `--all-targets` to the clippy
+target and burning down the existing test-code warnings — a project-wide
+lint-gate policy change, separate from any feature work.
 
 ## `frozen-series-effective-date`
 
