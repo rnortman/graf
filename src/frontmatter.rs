@@ -31,6 +31,15 @@ impl fmt::Display for Status {
 }
 
 impl Status {
+    /// All variants, in declaration order.
+    pub const ALL: [Status; 5] = [
+        Status::Todo,
+        Status::InProgress,
+        Status::Done,
+        Status::Cancelled,
+        Status::Reminder,
+    ];
+
     /// Returns true for terminal statuses (Done, Cancelled).
     pub fn is_terminal(&self) -> bool {
         matches!(self, Status::Done | Status::Cancelled)
@@ -567,6 +576,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_statuses_exhaustive() {
+        // Exhaustive match: adding a Status variant makes this non-exhaustive,
+        // a compile error prompting an update to Status::ALL. This is a nudge,
+        // not a proof of ALL's completeness.
+        for s in Status::ALL {
+            match s {
+                Status::Todo
+                | Status::InProgress
+                | Status::Done
+                | Status::Cancelled
+                | Status::Reminder => {}
+            }
+        }
+
+        // Serializations must be pairwise distinct (duplicate-entry guard).
+        let serialized: Vec<String> = Status::ALL.iter().map(|s| s.to_string()).collect();
+        for i in 0..serialized.len() {
+            for j in (i + 1)..serialized.len() {
+                assert_ne!(
+                    serialized[i], serialized[j],
+                    "duplicate status serialization in Status::ALL"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_basic_frontmatter() {
         let content = r#"---
 tldr: "Test document"
@@ -686,16 +722,24 @@ summary: "This is a longer description that provides more context."
 
     #[test]
     fn test_all_status_values() {
-        for (yaml, expected) in [
-            ("todo", Status::Todo),
-            ("in_progress", Status::InProgress),
-            ("done", Status::Done),
-            ("cancelled", Status::Cancelled),
-            ("reminder", Status::Reminder),
-        ] {
-            let content = format!("---\ntldr: test\nstatus: {yaml}\n---\n");
+        // Frozen on-disk spellings: the wire format written to markdown files.
+        // Pinned independently of Display so a coordinated rename across
+        // Display/FromStr/serde still trips here rather than silently changing
+        // the format under existing files.
+        assert_eq!(
+            Status::ALL.map(|s| s.to_string()),
+            ["todo", "in_progress", "done", "cancelled", "reminder"]
+        );
+
+        for s in Status::ALL {
+            // Display / FromStr roundtrip.
+            let rendered = s.to_string();
+            assert_eq!(rendered.parse::<Status>(), Ok(s.clone()));
+            // serde (YAML) roundtrip: the DB stores Display strings, so YAML
+            // parsing must map each Display spelling back to its variant.
+            let content = format!("---\ntldr: test\nstatus: {rendered}\n---\n");
             let fm = parse_frontmatter(&content).unwrap().unwrap();
-            assert_eq!(fm.status, Some(expected));
+            assert_eq!(fm.status, Some(s));
         }
     }
 

@@ -17,7 +17,7 @@ make release  — release build
 
 ## Principles
 
-**Fail fast.** No fallbacks. No swallowed errors. No "keep calm and carry on." CLI tools for agents serving two people — crash beats silent corruption.
+**Fail fast.** No fallbacks. No swallowed errors. No "keep calm and carry on." Crash beats silent corruption.
 
 **Resist disabling lint checks.** We use Rust to force correct code. Fix clippy warnings, don't suppress them.
 

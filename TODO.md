@@ -1,9 +1,5 @@
 # TODOs
 
-## `sql-terminal-status-strings`
-
-The SQL strings `status IN ('done', 'cancelled')` appear in the ORDER BY and horizon WHERE clauses of `db.rs`. These are hardcoded string literals that must stay in sync with `Status::Done` and `Status::Cancelled` serialization. If a new terminal status were added, these would need manual updates found only by text search. Consider building the SQL fragment from `Status::is_terminal()` variants or a shared constant.
-
 ## `recurring-phase-2-remove-flat-rrule` — BLOCKED as of 2026-07-20
 
 `Frontmatter.rrule: Option<String>` is retained as a legacy-shape compat field (`src/frontmatter.rs`). Reindex eagerly migrates old files into the nested `recurrence` block, and no write path emits flat `rrule`. Once we're confident no repos still carry legacy-shape files (or are willing to surface them as parse errors for manual fix-up), remove the field and the associated `Field::Rrule` variant, plus the legacy-compat branches in `maybe_migrate_legacy` and `effective_rrule`.
