@@ -1,5 +1,8 @@
 use std::process::Command;
 
+// TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+// the caller's GIT_* environment.
+
 /// Create a git repo with a valid .md file.
 fn setup_repo(tmp: &std::path::Path) -> std::path::PathBuf {
     let dir = tmp.join("repo");

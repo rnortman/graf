@@ -33,6 +33,9 @@ fn mcp_session(repo_dir: &std::path::Path, requests: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+// TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+// the caller's GIT_* environment.
+
 /// Create a git repo inside a subdirectory of the tempdir.
 /// Uses a subdirectory named "repo" to avoid tempdir names starting with "."
 /// (which walkdir's dot-file filter would skip).

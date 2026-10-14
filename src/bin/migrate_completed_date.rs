@@ -40,17 +40,30 @@ struct FilePlan {
 // Frontmatter parsing that preserves completed_date
 // ---------------------------------------------------------------------------
 
-/// Temporary struct for migration: parses frontmatter including the
-/// now-removed `completed_date` field.
+/// The four date keys this migration reads, including the now-removed
+/// `completed_date`; every other frontmatter key is ignored.
 ///
-/// We can't use the main `Frontmatter` struct because it no longer has
-/// `completed_date`. Instead we parse the raw YAML to extract just what
-/// we need.
+/// The main `Frontmatter` struct has no `completed_date` and denies unknown
+/// fields, so it cannot be used here.
+///
+/// An absent key is `None`; a key that is present must hold a date, so an
+/// empty or null value is an error rather than being read as absent.
+#[derive(serde::Deserialize)]
 struct MigrationFrontmatter {
+    #[serde(default, deserialize_with = "present_date")]
     completed_date: Option<NaiveDate>,
+    #[serde(default, deserialize_with = "present_date")]
     on_date: Option<NaiveDate>,
+    #[serde(default, deserialize_with = "present_date")]
     start_date: Option<NaiveDate>,
+    #[serde(default, deserialize_with = "present_date")]
     end_date: Option<NaiveDate>,
+}
+
+/// Deserializes a key that is present in the YAML. Absent keys never reach
+/// this (`#[serde(default)]` supplies `None`), so null is rejected here.
+fn present_date<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<NaiveDate>, D::Error> {
+    <NaiveDate as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 fn parse_migration_frontmatter(content: &str) -> Result<Option<MigrationFrontmatter>> {
@@ -58,33 +71,8 @@ fn parse_migration_frontmatter(content: &str) -> Result<Option<MigrationFrontmat
     let Some(range) = range else {
         return Ok(None);
     };
-
-    let yaml_str = &content[range];
-    let mapping: serde_yaml::Value =
-        serde_yaml::from_str(yaml_str).context("failed to parse YAML")?;
-
-    let map = mapping
-        .as_mapping()
-        .context("frontmatter is not a YAML mapping")?;
-
-    fn get_date(map: &serde_yaml::Mapping, key: &str) -> Result<Option<NaiveDate>> {
-        let Some(val) = map.get(serde_yaml::Value::String(key.to_string())) else {
-            return Ok(None);
-        };
-        let s = val
-            .as_str()
-            .with_context(|| format!("{key} is not a string (might be a timestamp?)"))?;
-        let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .with_context(|| format!("{key} is not a valid date: {s}"))?;
-        Ok(Some(d))
-    }
-
-    Ok(Some(MigrationFrontmatter {
-        completed_date: get_date(map, "completed_date")?,
-        on_date: get_date(map, "on_date")?,
-        start_date: get_date(map, "start_date")?,
-        end_date: get_date(map, "end_date")?,
-    }))
+    let mfm = frontmatter::from_yaml_str(&content[range]).context("failed to parse YAML")?;
+    Ok(Some(mfm))
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +571,79 @@ mod tests {
     #[test]
     fn test_timestamp_in_completed_date_is_error() {
         let content = make_file("tldr: test\nstatus: done\ncompleted_date: 2026-04-10T14:30:00Z");
-        let result = plan_file(Path::new("test.md"), &content);
-        assert!(result.is_err());
+        let err = plan_file(Path::new("test.md"), &content)
+            .err()
+            .expect("timestamp must not parse as a date");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test.md"), "{msg}");
+        assert!(msg.contains("line 3"), "error must locate the value: {msg}");
+    }
+
+    #[test]
+    fn test_unquoted_date_plans_like_quoted() {
+        let content = make_file(
+            "tldr: test
+status: done
+completed_date: 2026-04-10",
+        );
+        let plan = plan_file(Path::new("test.md"), &content).unwrap().unwrap();
+        let MigrationAction::MigrateAndRemove {
+            target_field,
+            value,
+        } = plan.action
+        else {
+            panic!("expected MigrateAndRemove");
+        };
+        assert_eq!(target_field, Field::OnDate);
+        assert_eq!(value, NaiveDate::from_ymd_opt(2026, 4, 10).unwrap());
+    }
+
+    #[test]
+    fn test_present_but_empty_or_null_date_is_error() {
+        for (yaml, line) in [
+            ("completed_date:", "line 3"),
+            ("completed_date: ~", "line 3"),
+            ("completed_date: null", "line 3"),
+            ("start_date: ~\ncompleted_date: '2026-01-02'", "line 3"),
+        ] {
+            let content = make_file(&format!("tldr: test\nstatus: done\n{yaml}"));
+            let err = plan_file(Path::new("test.md"), &content)
+                .err()
+                .unwrap_or_else(|| panic!("{yaml:?} must be an error"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains("test.md"), "{msg}");
+            assert!(msg.contains(line), "{yaml:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_non_date_value_is_error() {
+        for value in ["3", "{a: b}", "[2026-04-10]", "'next week'"] {
+            let content = make_file(&format!(
+                "tldr: test\nstatus: done\non_date: {value}\ncompleted_date: '2026-04-10'"
+            ));
+            let err = plan_file(Path::new("test.md"), &content)
+                .err()
+                .unwrap_or_else(|| panic!("on_date: {value} must be an error"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains("line 3"), "{value}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_unrelated_nested_blocks_are_ignored() {
+        let content = make_file(
+            "tldr: test\nstatus: done\nrecurrence:\n  rrule: FREQ=DAILY\n  lead_days: 2\n\
+             completion_log:\n  - completed: 2026-04-01\n    comment: |-\n      a\n      b\n\
+             labels: [x, y]\ncompleted_date: '2026-04-10'",
+        );
+        let plan = plan_file(Path::new("test.md"), &content).unwrap().unwrap();
+        assert!(matches!(
+            plan.action,
+            MigrationAction::MigrateAndRemove {
+                target_field: Field::OnDate,
+                ..
+            }
+        ));
     }
 }

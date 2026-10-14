@@ -15,6 +15,9 @@ fn graf_cmd() -> Command {
     cmd
 }
 
+// TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+// the caller's GIT_* environment.
+
 /// Create a git repo with some todo files.
 fn setup_repo(tmp: &std::path::Path) -> std::path::PathBuf {
     let dir = tmp.join("repo");

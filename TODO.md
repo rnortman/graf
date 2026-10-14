@@ -66,3 +66,35 @@ branch of the effective-date expression prefers `on_date`/`end_date` (a schema
 bump plus an index review, since `EFF_DATE` must stay textually identical
 across the schema index, SELECT, WHERE and ORDER BY), or the final-occurrence
 ordering is declared intended and documented as such.
+
+## `git-env-leaks-into-test-repos`
+
+Every git spawn in graf is a bare `Command::new("git")` that inherits the
+caller's environment: production `src/git.rs` (all four functions) and the
+tests in `src/db.rs` (`run_git` plus five direct spawns that bypass it),
+`src/todo.rs`, `src/cli/mcp.rs`, `tests/multi_repo_integration.rs`,
+`tests/todo_integration.rs`, `tests/mcp_integration.rs` and
+`tests/lint_integration.rs`. Each file carries one
+`TODO(git-env-leaks-into-test-repos)` marker; the work covers every spawn in
+the file, not only the marked line.
+
+Under a pre-commit hook, git exports `GIT_INDEX_FILE` (absolute under
+`git commit -a` or `git commit <pathspec>`, and from a linked worktree in
+every form, where `GIT_DIR` is exported too) plus `GIT_AUTHOR_*` and
+`GIT_PREFIX` unconditionally. The test suite then operates on the outer
+repo's pending index: parallel tests collide on `index.lock.lock`, foreign
+blobs appear as `invalid object … for '<file>'`, and the outer commit's index
+is rewritten by the tests (git re-reads it after the hook), so a passing hook
+could silently commit a temp repo's paths. Until this is fixed, graf commits
+are made with `git add <paths>` and a bare `git commit` from the main
+worktree.
+
+Work: route every git spawn through one helper that scrubs `GIT_*` and pins
+config sources (`GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` = `/dev/null`,
+`GIT_CEILING_DIRECTORIES` at the temp root), with a test that sets a bogus
+`GIT_INDEX_FILE` and proves the helper ignores it. Open questions needing a
+design decision: whether production `src/git.rs` scrubs as well (graf run
+from inside someone else's hook has the same exposure), and whether to take
+brenn's `git-fixture` as a dev-dependency or write a graf-local helper.
+Deferred because it spans eight files and 42 call sites plus that mechanism
+decision.

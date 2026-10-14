@@ -16,6 +16,9 @@ pub struct ChangedFile {
     pub change: FileChange,
 }
 
+// TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+// the caller's GIT_* environment.
+
 /// Returns the SHA of HEAD.
 ///
 /// # Panics

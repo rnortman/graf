@@ -397,7 +397,7 @@ pub fn rewrite_frontmatter(content: &str, mutations: &[FieldMutation]) -> Result
 /// Append one completion_log entry. Creates the block if absent.
 ///
 /// Emits flow style (single line, `- { completed: …, … }`) normally, and
-/// switches to block style with a `comment: |` block scalar when the
+/// switches to block style with a `comment: |-` block scalar when the
 /// comment contains a newline.
 fn append_completion_log_entry(lines: &mut Vec<String>, entry: &CompletionLogEntry) {
     let item_lines = format_completion_log_entry(entry);
@@ -433,7 +433,7 @@ fn append_completion_log_entry(lines: &mut Vec<String>, entry: &CompletionLogEnt
 
 /// Render an entry as one or more YAML lines. Flow form (single line) for
 /// entries without a multi-line comment; block form (multi-line, with
-/// `comment: |` block scalar) when the comment carries a newline.
+/// `comment: |-` block scalar) when the comment carries a newline.
 fn format_completion_log_entry(entry: &CompletionLogEntry) -> Vec<String> {
     let multiline_comment = entry.comment.as_deref().is_some_and(|c| c.contains('\n'));
     if multiline_comment {
@@ -456,8 +456,11 @@ fn format_completion_log_entry_flow(entry: &CompletionLogEntry) -> String {
 }
 
 /// Block form, used when the comment contains a newline. The block-scalar
-/// `comment: |` literal preserves interior newlines and keeps the entry
-/// diff-friendly. Each line is right-trimmed.
+/// literal preserves interior newlines and keeps the entry diff-friendly.
+/// Each line is right-trimmed. Strip chomping (`|-`) makes the round trip
+/// exact whether or not the entry is the last thing in the frontmatter:
+/// with clip chomping (`|`), a block ending at end-of-input reads back with
+/// or without a final newline depending on the parser.
 fn format_completion_log_entry_block(entry: &CompletionLogEntry) -> Vec<String> {
     let mut out = vec![format!("  - completed: {}", entry.completed)];
     if let Some(occ) = entry.occurrence {
@@ -468,7 +471,7 @@ fn format_completion_log_entry_block(entry: &CompletionLogEntry) -> Vec<String> 
         .comment
         .as_deref()
         .expect("block form only reached when comment is multi-line");
-    out.push("    comment: |".to_string());
+    out.push("    comment: |-".to_string());
     // `split('\n')` rather than `.lines()` so a trailing newline becomes an
     // empty line in the output — preserving interior newline count.
     // Trim trailing blank lines (no point emitting `      ` for them).
@@ -495,7 +498,9 @@ fn format_completion_log_entry_block(entry: &CompletionLogEntry) -> Vec<String> 
 pub fn yaml_scalar(s: &str) -> String {
     // Force quoting when the value contains characters that YAML parsers treat
     // as special, including \r (YAML 1.2 line break) and indicator chars that
-    // change scalar interpretation when they appear at the start of a value.
+    // change scalar interpretation when they appear at the start of a value,
+    // and for the core-schema null spellings, which would otherwise read back
+    // as null rather than as the string.
     let starts_with_indicator = s
         .starts_with(['&', '*', '!', '|', '>', '?', '[', ']', '%', '@', '`', '\''])
         || s.starts_with("- ");
@@ -504,6 +509,7 @@ pub fn yaml_scalar(s: &str) -> String {
         || s.ends_with(' ')
         || s.ends_with(':')
         || s.is_empty()
+        || matches!(s, "null" | "Null" | "NULL" | "~")
         || starts_with_indicator;
     if needs_quote {
         let escaped = s
@@ -548,6 +554,16 @@ pub fn frontmatter_yaml_range(content: &str) -> Result<Option<Range<usize>>> {
     Ok(Some(yaml_start..yaml_end))
 }
 
+/// Deserialize YAML text into `T`.
+///
+/// Errors are a single line ending in `at line L, column C`: the parser's
+/// default source snippet is turned off, since callers add their own context
+/// (file path, operation) and the snippet would otherwise repeat the message
+/// and dump surrounding frontmatter into every error.
+pub fn from_yaml_str<'de, T: Deserialize<'de>>(yaml: &'de str) -> Result<T, serde_saphyr::Error> {
+    serde_saphyr::from_str_with_options(yaml, serde_saphyr::options! { with_snippet: false })
+}
+
 /// Extract YAML frontmatter from a markdown file's contents.
 ///
 /// Returns `None` if the file has no frontmatter (doesn't start with `---`).
@@ -557,9 +573,8 @@ pub fn parse_frontmatter(content: &str) -> Result<Option<Frontmatter>> {
         return Ok(None);
     };
 
-    let yaml_str = &content[range];
     let fm: Frontmatter =
-        serde_yaml::from_str(yaml_str).context("failed to parse YAML frontmatter")?;
+        from_yaml_str(&content[range]).context("failed to parse YAML frontmatter")?;
 
     Ok(Some(fm))
 }
@@ -706,6 +721,78 @@ summary: "This is a longer description that provides more context."
             msg.contains("bogus_field"),
             "error should mention the unknown field: {msg}"
         );
+    }
+
+    #[test]
+    fn test_parse_error_is_one_line_with_location() {
+        let content = "---\ntldr: test\nbogus_field: true\n---\n";
+        let msg = format!("{:#}", parse_frontmatter(content).unwrap_err());
+        assert!(!msg.contains('\n'), "error must be one line: {msg}");
+        assert!(msg.contains("line 2"), "error must carry the line: {msg}");
+        assert_eq!(
+            msg.matches("unknown field").count(),
+            1,
+            "diagnosis must appear once: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_key_is_error() {
+        let content = "---\ntldr: a\ntldr: b\n---\n";
+        let msg = format!("{:#}", parse_frontmatter(content).unwrap_err());
+        assert!(msg.contains("duplicate"), "{msg}");
+    }
+
+    #[test]
+    fn test_yaml_scalar_quotes_null_spellings() {
+        for s in ["null", "Null", "NULL", "~"] {
+            let q = yaml_scalar(s);
+            assert_ne!(q, s, "{s} must be quoted");
+            let content =
+                format!("---\ntldr: t\nlabels: [{q}]\nlinks:\n  - {q}\nsummary: {q}\n---\n");
+            let fm = parse_frontmatter(&content).unwrap().unwrap();
+            assert_eq!(fm.labels, vec![s.to_string()]);
+            assert_eq!(fm.links, vec![s.to_string()]);
+            assert_eq!(fm.summary.as_deref(), Some(s));
+        }
+    }
+
+    #[test]
+    fn test_parser_fact_bare_null_is_none_and_yaml_1_1_booleans_are_strings() {
+        // Parser facts (YAML 1.2 core schema), not graf rules: a bare null
+        // into an Option field is None; `no`/`yes` into a string field are
+        // strings.
+        let content = "---\ntldr: no\nlabels: [yes, off]\nsummary: null\n---\n";
+        let fm = parse_frontmatter(content).unwrap().unwrap();
+        assert_eq!(fm.tldr, "no");
+        assert_eq!(fm.labels, vec!["yes".to_string(), "off".to_string()]);
+        assert_eq!(fm.summary, None);
+    }
+
+    #[test]
+    fn test_parser_fact_quoted_numbers_accepted_for_numeric_fields() {
+        // Parser fact, not a graf rule: a quoted number deserializes into a
+        // numeric field.
+        let content = "---\ntldr: t\npriority: \"3\"\nsort_order: \"1.5\"\n---\n";
+        let fm = parse_frontmatter(content).unwrap().unwrap();
+        assert_eq!(fm.priority, Some(3));
+        assert_eq!(fm.sort_order, Some(1.5));
+    }
+
+    #[test]
+    fn test_parser_fact_legacy_clip_comment_keeps_trailing_newline() {
+        // Parser fact, not a graf rule: files from earlier graf versions carry
+        // `comment: |` (clip chomping), which reads back with a trailing
+        // newline whether the entry ends the frontmatter or not.
+        let block =
+            "tldr: t\ncompletion_log:\n  - completed: 2026-03-01\n    comment: |\n      a\n      b";
+        for content in [
+            format!("---\n{block}\n---\n"),
+            format!("---\n{block}\nstatus: todo\n---\n"),
+        ] {
+            let fm = parse_frontmatter(&content).unwrap().unwrap();
+            assert_eq!(fm.completion_log[0].comment.as_deref(), Some("a\nb\n"));
+        }
     }
 
     #[test]
@@ -1385,7 +1472,7 @@ status: todo
         append_completion_log_entry(&mut lines, &entry);
         let yaml = lines.join("\n");
         let parsed: crate::frontmatter::Frontmatter =
-            serde_yaml::from_str(&yaml).expect("reparse round-tripped YAML");
+            from_yaml_str(&yaml).expect("reparse round-tripped YAML");
         assert_eq!(parsed.completion_log.len(), 1);
         assert_eq!(parsed.completion_log[0], entry);
     }
@@ -1393,7 +1480,7 @@ status: todo
     #[test]
     fn test_append_completion_log_multiline_comment_emits_block_scalar() {
         // Multi-line comments switch the entry from flow to block
-        // form, using `comment: |` to preserve interior newlines.
+        // form, using `comment: |-` to preserve interior newlines.
         let mut lines = vec!["tldr: test".to_string(), "status: todo".to_string()];
         let entry = CompletionLogEntry {
             completed: NaiveDate::from_ymd_opt(2026, 4, 22).unwrap(),
@@ -1403,13 +1490,13 @@ status: todo
         append_completion_log_entry(&mut lines, &entry);
         let yaml = lines.join("\n");
 
-        // Assert block-scalar shape: no flow braces on this entry, and `|`
+        // Assert block-scalar shape: no flow braces on this entry, and `|-`
         // appears before the indented content lines.
         assert!(
             yaml.contains("  - completed: 2026-04-22"),
             "block form uses `- completed:` line, not flow mapping: {yaml}",
         );
-        assert!(yaml.contains("    comment: |"));
+        assert!(yaml.contains("    comment: |-"));
         assert!(yaml.contains("      first line"));
         assert!(yaml.contains("      second line"));
         // And — no `\n` escape from the old flow-form path.
@@ -1420,9 +1507,33 @@ status: todo
 
         // Round-trip: the emitted YAML reparses to the original entry.
         let parsed: crate::frontmatter::Frontmatter =
-            serde_yaml::from_str(&yaml).expect("reparse round-tripped YAML");
+            from_yaml_str(&yaml).expect("reparse round-tripped YAML");
         assert_eq!(parsed.completion_log.len(), 1);
         assert_eq!(parsed.completion_log[0], entry);
+    }
+
+    #[test]
+    fn test_append_completion_log_multiline_comment_roundtrips_before_next_key() {
+        // A block-form entry followed by another key must read back with no
+        // trailing newline, the same as when it ends the frontmatter.
+        let mut lines = vec!["tldr: test".to_string()];
+        let entry = CompletionLogEntry {
+            completed: NaiveDate::from_ymd_opt(2026, 4, 22).unwrap(),
+            occurrence: None,
+            comment: Some("first line\nsecond line".to_string()),
+        };
+        append_completion_log_entry(&mut lines, &entry);
+        lines.push("status: todo".to_string());
+        let yaml = lines.join("\n");
+
+        let parsed: crate::frontmatter::Frontmatter =
+            from_yaml_str(&yaml).expect("reparse round-tripped YAML");
+        assert_eq!(parsed.completion_log.len(), 1);
+        assert_eq!(parsed.completion_log[0], entry);
+        assert_eq!(
+            parsed.completion_log[0].comment.as_deref(),
+            Some("first line\nsecond line"),
+        );
     }
 
     #[test]

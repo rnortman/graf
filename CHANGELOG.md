@@ -3,6 +3,33 @@
 Notable changes to graf. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- YAML frontmatter is now parsed by `serde-saphyr` instead of the deprecated
+  `serde_yaml`, whose underlying `unsafe-libyaml` library is unmaintained
+  (security advisory RUSTSEC-2024-0449). This clears the advisory from
+  graf's dependency tree. Most files parse exactly as before; the visible
+  differences are:
+  - frontmatter parse errors are a single line ending in
+    `at line L, column C`;
+  - quoted numbers (`priority: "3"`) are accepted for numeric fields;
+  - YAML `<<` merge keys are expanded;
+  - a `comment: |` block that ends the frontmatter reads back with a
+    trailing newline.
+- The `migrate_completed_date` tool now rejects a date key that is present
+  but empty or null, instead of treating it as absent.
+
+### Fixed
+
+- Values spelled `null`, `Null`, `NULL` or `~` are written quoted, so a label,
+  link or other text field holding that word reads back as text instead of
+  failing to parse.
+- Multi-line `completion_log` comments are written as `comment: |-`, so they
+  round-trip without gaining a trailing newline wherever the entry sits in
+  the frontmatter.
+
 ## [0.5.0] — 2026-07-20
 
 First public release. Versions before 0.5.0 were developed privately and are

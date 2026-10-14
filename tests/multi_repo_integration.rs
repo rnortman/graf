@@ -21,6 +21,9 @@ fn graf(args: &[&str], manifest_path: &Path) -> std::process::Output {
         .expect("failed to run graf")
 }
 
+// TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+// the caller's GIT_* environment.
+
 /// Create a git repo with a .graf/config.toml and some todo files.
 /// Returns the repo directory.
 fn setup_repo_with_config(

@@ -1223,6 +1223,8 @@ mod tests {
         })
     }
 
+    // TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+    // the caller's GIT_* environment.
     fn run_git(dir: &std::path::Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .args(args)

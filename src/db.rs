@@ -925,6 +925,8 @@ mod tests {
 
     // -- Test helpers --
 
+    // TODO(git-env-leaks-into-test-repos): every git spawn in this file inherits
+    // the caller's GIT_* environment.
     fn run_git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
