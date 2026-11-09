@@ -30,6 +30,13 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   round-trip without gaining a trailing newline wherever the entry sits in
   the frontmatter.
 
+### Security
+
+- The bundled SQLite moves from 3.51.3 to 3.54.1 (`rusqlite` 0.41.1,
+  `libsqlite3-sys` 0.39.1), which carries the fix for CVE-2026-119375
+  (RUSTSEC-2026-0459): a database opened together with a crafted `-wal` file
+  of a different page size could return uninitialized memory.
+
 ## [0.5.0] — 2026-07-20
 
 First public release. Versions before 0.5.0 were developed privately and are

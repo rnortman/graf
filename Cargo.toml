@@ -29,7 +29,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 iana-time-zone = "0.1.65"
 ordered-float = "5.3.0"
 rrule = "0.14.0"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 serde_json = "1.0.149"
